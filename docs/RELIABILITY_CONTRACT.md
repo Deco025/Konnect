@@ -102,7 +102,7 @@ is separate from this policy:
 | Follow-up | Planned automation or implementation |
 |---|---|
 | [#551](https://github.com/mixelpixx/Konnect/pull/551) | Compiled/cached Draft 2020-12 validation for domain and meta-tools, catalogue conformance, checked unit handling, and positive sheet dimensions; coordinated with #546/#547/#543 |
-| [#552](https://github.com/mixelpixx/Konnect/pull/552) | Reusable IPC mock fixtures, including #544 |
+| [#552](https://github.com/mixelpixx/Konnect/pull/552) | Shared, lifecycle-owned `inproc://` IPC test fixture; migrates the five racy mocks from #544 and covers readiness, concurrency, repeated use, and cleanup after success or responder failure |
 | [#553](https://github.com/mixelpixx/Konnect/pull/553) | Shared outcomes and initial handler/observer migration |
 | [#554](https://github.com/mixelpixx/Konnect/pull/554) | Automated enforcement with an explicit legacy inventory |
 

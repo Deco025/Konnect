@@ -2401,10 +2401,13 @@ mod tests {
         path
     }
 
-    fn ctx_with_open_board(board: &std::path::Path) -> ToolContext {
-        let address =
+    fn ctx_with_open_board(
+        board: &std::path::Path,
+    ) -> (ToolContext, crate::test_support::MockIpcServer) {
+        let server =
             crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(board, |_| None);
-        crate::tools::pcb_board::board_mock::ctx_talking_to(address)
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+        (ctx, server)
     }
 
     /// The decoupling planner must clear the fixture's only deduction: C1/C2
@@ -2482,9 +2485,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let before = std::fs::read(&board).unwrap();
+        let (ctx, _server) = ctx_with_open_board(&board);
         let result = handle_place_decoupling(
             &json!({"board": board, "ic_reference": "U1", "dry_run": false}),
-            &ctx_with_open_board(&board),
+            &ctx,
         )
         .await
         .unwrap();
@@ -2501,9 +2505,10 @@ mod tests {
         let other = dir.path().join("other.kicad_pcb");
         std::fs::write(&other, "").unwrap();
         let before = std::fs::read(&board).unwrap();
+        let (ctx, _server) = ctx_with_open_board(&other);
         let result = handle_place_decoupling(
             &json!({"board": board, "ic_reference": "U1", "dry_run": false}),
-            &ctx_with_open_board(&other),
+            &ctx,
         )
         .await
         .unwrap();
@@ -2574,12 +2579,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let before = std::fs::read(&board).unwrap();
-        let result = handle_auto_place(
-            &json!({"board": board, "dry_run": false}),
-            &ctx_with_open_board(&board),
-        )
-        .await
-        .unwrap();
+        let (ctx, _server) = ctx_with_open_board(&board);
+        let result = handle_auto_place(&json!({"board": board, "dry_run": false}), &ctx)
+            .await
+            .unwrap();
 
         assert!(result.is_error);
         assert!(result_text(&result).contains("auto_place_from_schematic"));
@@ -2593,12 +2596,10 @@ mod tests {
         let other = dir.path().join("other.kicad_pcb");
         std::fs::write(&other, "").unwrap();
         let before = std::fs::read(&board).unwrap();
-        let result = handle_auto_place(
-            &json!({"board": board, "dry_run": false}),
-            &ctx_with_open_board(&other),
-        )
-        .await
-        .unwrap();
+        let (ctx, _server) = ctx_with_open_board(&other);
+        let result = handle_auto_place(&json!({"board": board, "dry_run": false}), &ctx)
+            .await
+            .unwrap();
 
         assert!(!result.is_error, "{result:?}");
         assert_ne!(std::fs::read(&board).unwrap(), before);
@@ -2609,12 +2610,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let before = std::fs::read(&board).unwrap();
-        let result = handle_force_directed(
-            &json!({"board": board, "dry_run": false}),
-            &ctx_with_open_board(&board),
-        )
-        .await
-        .unwrap();
+        let (ctx, _server) = ctx_with_open_board(&board);
+        let result = handle_force_directed(&json!({"board": board, "dry_run": false}), &ctx)
+            .await
+            .unwrap();
 
         assert!(result.is_error);
         assert!(result_text(&result).contains("refine_placement_force_directed"));
@@ -2628,12 +2627,10 @@ mod tests {
         let other = dir.path().join("other.kicad_pcb");
         std::fs::write(&other, "").unwrap();
         let before = std::fs::read(&board).unwrap();
-        let result = handle_force_directed(
-            &json!({"board": board, "dry_run": false}),
-            &ctx_with_open_board(&other),
-        )
-        .await
-        .unwrap();
+        let (ctx, _server) = ctx_with_open_board(&other);
+        let result = handle_force_directed(&json!({"board": board, "dry_run": false}), &ctx)
+            .await
+            .unwrap();
 
         assert!(!result.is_error, "{result:?}");
         assert_ne!(std::fs::read(&board).unwrap(), before);

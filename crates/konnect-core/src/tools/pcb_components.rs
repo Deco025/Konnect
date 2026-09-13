@@ -4832,11 +4832,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let board = placed_fallback_fixture(tmp.path()).await;
         let before = std::fs::read_to_string(&board).unwrap();
+        let server = spawn_rejecting_kicad();
         let ctx = ToolContext::new(
             crate::tools::ServerConfig {
                 kicad_cli: String::new(),
                 kicad_binary: String::new(),
-                ipc_address: spawn_rejecting_kicad(),
+                ipc_address: server.address().to_string(),
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
@@ -5136,11 +5137,12 @@ mod tests {
                 .join("\n")
         );
         std::fs::write(&board, &before).unwrap();
+        let server = spawn_rejecting_kicad();
         let ctx = ToolContext::new(
             crate::tools::ServerConfig {
                 kicad_cli: String::new(),
                 kicad_binary: String::new(),
-                ipc_address: spawn_rejecting_kicad(),
+                ipc_address: server.address().to_string(),
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
@@ -5186,9 +5188,9 @@ mod tests {
                 .join("\n")
         );
         std::fs::write(&board, &before).unwrap();
-        let address =
+        let server =
             crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, |_| None);
-        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(address);
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
 
         let result = handle_flip_component(
             &json!({"board": board, "reference": "U1", "layer": "B.Cu"}),
@@ -5217,9 +5219,9 @@ mod tests {
         );
         std::fs::write(&board, &before).unwrap();
         std::fs::write(&other, "").unwrap();
-        let address =
+        let server =
             crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&other, |_| None);
-        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(address);
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
 
         let result = handle_flip_component(
             &json!({"board": board, "reference": "U1", "layer": "B.Cu"}),
@@ -5658,36 +5660,17 @@ mod tests {
     /// A rep0 endpoint that completes every round-trip with an error status —
     /// a live KiCAD saying no. Placement must fail closed: error out, and
     /// leave the board file alone.
-    fn spawn_rejecting_kicad() -> String {
-        use nng::options::Options;
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let url = format!("tcp://127.0.0.1:{port}");
-        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
-        socket
-            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        socket.listen(&url).expect("mock listen");
-        std::thread::spawn(move || {
-            use prost::Message;
-            while socket.recv().is_ok() {
-                let response = konnect_ipc::gen::kiapi::common::ApiResponse {
-                    status: Some(konnect_ipc::gen::kiapi::common::ApiResponseStatus {
-                        status: konnect_ipc::gen::kiapi::common::ApiStatusCode::AsBadRequest as i32,
-                        error_message: "mock rejects everything".to_string(),
-                    }),
-                    header: None,
-                    message: None,
-                };
-                let out = nng::Message::from(response.encode_to_vec().as_slice());
-                if socket.send(out).is_err() {
-                    break;
-                }
+    fn spawn_rejecting_kicad() -> crate::test_support::MockIpcServer {
+        crate::test_support::MockIpcServer::spawn("rejecting-component", |_| {
+            konnect_ipc::gen::kiapi::common::ApiResponse {
+                status: Some(konnect_ipc::gen::kiapi::common::ApiResponseStatus {
+                    status: konnect_ipc::gen::kiapi::common::ApiStatusCode::AsBadRequest as i32,
+                    error_message: "mock rejects everything".to_string(),
+                }),
+                header: None,
+                message: None,
             }
-        });
-        url
+        })
     }
 
     #[tokio::test]
@@ -5696,11 +5679,12 @@ mod tests {
         let board = fallback_fixture(tmp.path());
         let board_before = std::fs::read_to_string(&board).unwrap();
 
+        let server = spawn_rejecting_kicad();
         let ctx = ToolContext::new(
             crate::tools::ServerConfig {
                 kicad_cli: String::new(),
                 kicad_binary: String::new(),
-                ipc_address: spawn_rejecting_kicad(),
+                ipc_address: server.address().to_string(),
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
@@ -5790,69 +5774,51 @@ mod tests {
 
     /// A rep0 endpoint playing a KiCad that holds `board` open with `items` on
     /// it — a live board carrying edits the file on disk has never seen.
-    fn spawn_kicad_holding(board: &Path, items: Vec<prost_types::Any>) -> String {
+    fn spawn_kicad_holding(
+        board: &Path,
+        items: Vec<prost_types::Any>,
+    ) -> crate::test_support::MockIpcServer {
         use konnect_ipc::gen::kiapi;
-        use nng::options::Options;
-        use prost::Message;
-
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let url = format!("tcp://127.0.0.1:{port}");
-        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
-        socket
-            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        socket.listen(&url).expect("mock listen");
 
         let board = board.to_string_lossy().to_string();
-        std::thread::spawn(move || {
-            while let Ok(message) = socket.recv() {
-                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
-                let command = request.message.expect("a command");
-                let body = if command.type_url.ends_with("GetOpenDocuments") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: vec![kiapi::common::types::DocumentSpecifier {
-                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                                project: None,
-                                identifier: Some(
-                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                        board.clone(),
-                                    ),
+        crate::test_support::MockIpcServer::spawn("component-items", move |request| {
+            let command = request.message.expect("a command");
+            let body = if command.type_url.ends_with("GetOpenDocuments") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: vec![kiapi::common::types::DocumentSpecifier {
+                            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                            project: None,
+                            identifier: Some(
+                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                    board.clone(),
                                 ),
-                            }],
-                        },
-                        "kiapi.common.commands.GetOpenDocumentsResponse",
-                    ))
-                } else if command.type_url.ends_with("GetItems") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::common::commands::GetItemsResponse {
-                            header: None,
-                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                            items: items.clone(),
-                        },
-                        "kiapi.common.commands.GetItemsResponse",
-                    ))
-                } else {
-                    None
-                };
-                let response = kiapi::common::ApiResponse {
-                    status: Some(kiapi::common::ApiResponseStatus {
-                        status: kiapi::common::ApiStatusCode::AsOk as i32,
-                        error_message: String::new(),
-                    }),
-                    header: None,
-                    message: body,
-                };
-                let out = nng::Message::from(response.encode_to_vec().as_slice());
-                if socket.send(out).is_err() {
-                    break;
-                }
+                            ),
+                        }],
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                ))
+            } else if command.type_url.ends_with("GetItems") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: items.clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else {
+                None
+            };
+            kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsOk as i32,
+                    error_message: String::new(),
+                }),
+                header: None,
+                message: body,
             }
-        });
-        url
+        })
     }
 
     fn ctx_talking_to(address: String) -> ToolContext {
@@ -5879,7 +5845,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let board = tmp.path().join("b.kicad_pcb");
         std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
-        let address = spawn_kicad_holding(
+        let server = spawn_kicad_holding(
             &board,
             vec![live_footprint(
                 "R1",
@@ -5889,7 +5855,7 @@ mod tests {
 
         let res = handle_get_component_pads(
             &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
-            &ctx_talking_to(address),
+            &ctx_talking_to(server.address().to_string()),
         )
         .await
         .unwrap();
@@ -5910,11 +5876,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let board = tmp.path().join("b.kicad_pcb");
         std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
-        let address = spawn_kicad_holding(&board, vec![]);
+        let server = spawn_kicad_holding(&board, vec![]);
 
         let res = handle_get_component_pads(
             &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
-            &ctx_talking_to(address),
+            &ctx_talking_to(server.address().to_string()),
         )
         .await
         .unwrap();
@@ -5930,11 +5896,11 @@ mod tests {
         std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
         // The part is there, its pads are not — the shape a response we
         // failed to read would also take.
-        let address = spawn_kicad_holding(&board, vec![live_footprint("R1", vec![])]);
+        let server = spawn_kicad_holding(&board, vec![live_footprint("R1", vec![])]);
 
         let res = handle_get_component_pads(
             &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
-            &ctx_talking_to(address),
+            &ctx_talking_to(server.address().to_string()),
         )
         .await
         .unwrap();
@@ -5949,11 +5915,11 @@ mod tests {
         let board = tmp.path().join("b.kicad_pcb");
         std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
         // The saved file has no LOGO1 to disagree, so KiCad's answer stands.
-        let address = spawn_kicad_holding(&board, vec![live_footprint("LOGO1", vec![])]);
+        let server = spawn_kicad_holding(&board, vec![live_footprint("LOGO1", vec![])]);
 
         let res = handle_get_component_pads(
             &json!({ "board": board.to_string_lossy(), "reference": "LOGO1" }),
-            &ctx_talking_to(address),
+            &ctx_talking_to(server.address().to_string()),
         )
         .await
         .unwrap();
@@ -5993,9 +5959,10 @@ mod tests {
         let board = tmp.path().join("b.kicad_pcb");
         std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
 
+        let server = spawn_rejecting_kicad();
         let res = handle_get_component_pads(
             &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
-            &ctx_talking_to(spawn_rejecting_kicad()),
+            &ctx_talking_to(server.address().to_string()),
         )
         .await
         .unwrap();
@@ -6012,7 +5979,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let board = tmp.path().join("b.kicad_pcb");
         std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
-        let address = spawn_kicad_holding(
+        let server = spawn_kicad_holding(
             &board,
             vec![live_footprint(
                 "R1",
@@ -6022,7 +5989,7 @@ mod tests {
 
         let res = handle_get_pad_position(
             &json!({ "board": board.to_string_lossy(), "reference": "R1", "pad_number": "1" }),
-            &ctx_talking_to(address),
+            &ctx_talking_to(server.address().to_string()),
         )
         .await
         .unwrap();

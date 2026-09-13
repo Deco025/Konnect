@@ -1050,7 +1050,7 @@ mod delete_trace_tests {
         std::fs::write(&board, original).unwrap();
         let delete_count = Arc::new(Mutex::new(0usize));
         let delete_count_in_mock = delete_count.clone();
-        let address = spawn_kicad_holding_board(&board, move |command| {
+        let server = spawn_kicad_holding_board(&board, move |command| {
             if command.type_url.ends_with("GetItems") {
                 return Some(konnect_ipc::builders::pack_any(
                     &kiapi::common::commands::GetItemsResponse {
@@ -1075,7 +1075,7 @@ mod delete_trace_tests {
             None
         });
 
-        let ctx = ctx_talking_to(address);
+        let ctx = ctx_talking_to(server.address().to_string());
         for uuid in ["via-1", "zone-1", "graphic-1", "footprint-1", "missing-1"] {
             let result = handle_delete_trace(
                 &json!({ "board": board.to_string_lossy(), "uuid": uuid }),
@@ -1108,7 +1108,7 @@ mod delete_trace_tests {
             value: "segment-1".to_string(),
         });
         let packed_track = konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track");
-        let address = spawn_kicad_holding_board(&board, move |command| {
+        let server = spawn_kicad_holding_board(&board, move |command| {
             if command.type_url.ends_with("GetItems") {
                 let items = if *deleted_in_mock.lock().unwrap() {
                     vec![]
@@ -1140,7 +1140,7 @@ mod delete_trace_tests {
 
         let result = handle_delete_trace(
             &json!({ "board": board.to_string_lossy(), "uuid": "segment-1" }),
-            &ctx_talking_to(address),
+            &ctx_talking_to(server.address().to_string()),
         )
         .await
         .unwrap();
