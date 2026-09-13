@@ -140,6 +140,20 @@ async fn place(name: &str, child: &Path) -> CallToolResult {
     (tool.handler)(&args, context).await.unwrap()
 }
 
+async fn add_native_component(child: &Path, component: Value) -> CallToolResult {
+    let mut args = component;
+    args["schematic"] = json!(child.display().to_string());
+    let context = Arc::new(ToolContext::new(
+        ServerConfig::default(),
+        Arc::new(ToolRouter::new()),
+    ));
+    let tool = sch_components::tools()
+        .into_iter()
+        .find(|tool| tool.name == "add_schematic_component")
+        .unwrap();
+    (tool.handler)(&args, context).await.unwrap()
+}
+
 fn body(result: &CallToolResult) -> Value {
     let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
         panic!("expected text result")
@@ -231,6 +245,65 @@ async fn native_placement_preserves_unique_and_reused_paths_with_committed_readb
             );
         }
     }
+}
+
+#[tokio::test]
+async fn native_library_value_and_footprint_reach_the_placed_instance() {
+    let (_directory, _root, child) = fixture(false);
+    let result = add_native_component(
+        &child,
+        json!({
+            "lib_id": "complex_hierarchy:MPSA42",
+            "reference": "Q999",
+            "x": 100.0,
+            "y": 80.0
+        }),
+    )
+    .await;
+    assert!(!result.is_error, "{result:?}");
+    let response = body(&result);
+    assert_eq!(response["fields"]["Value"], "MPSA42");
+    assert_eq!(response["fields"]["Footprint"], "TO92-CBE");
+
+    let committed = Schematic::load(&child).unwrap();
+    let symbol = committed.symbols.by_reference("Q999").unwrap();
+    assert_eq!(symbol.value_str(), Some("MPSA42"));
+    assert_eq!(symbol.footprint(), Some("TO92-CBE"));
+}
+
+/// The fixture is a KiCad-authored schematic whose embedded MPSA42 symbol has
+/// a non-empty library Footprint. This live check proves KiCad's own netlister
+/// consumes the placed instance field rather than merely trusting our readback.
+#[tokio::test]
+#[ignore = "needs an installed KiCad 10 kicad-cli"]
+async fn kicad_netlist_contains_the_library_footprint_after_placement() {
+    let (_directory, _root, child) = fixture(false);
+    let result = add_native_component(
+        &child,
+        json!({
+            "lib_id": "complex_hierarchy:MPSA42",
+            "reference": "Q999",
+            "x": 100.0,
+            "y": 80.0
+        }),
+    )
+    .await;
+    assert!(!result.is_error, "{result:?}");
+
+    let output = child.with_extension("net");
+    let cli = crate::kicad_install::find_cli("").expect("installed kicad-cli");
+    crate::tools::cli::export_netlist(&cli.display().to_string(), &child, &output, "kicadsexpr")
+        .await
+        .unwrap();
+    let netlist = std::fs::read_to_string(output).unwrap();
+    let q999 = netlist
+        .split("(comp")
+        .find(|component| component.contains("(ref \"Q999\")"))
+        .expect("Q999 in netlist");
+    assert!(
+        q999.contains("(footprint \"TO92-CBE\")"),
+        "KiCad must emit the library footprint for Q999:\n{q999}"
+    );
 }
 
 #[tokio::test]
@@ -358,6 +431,7 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
         "symbol",
         "Reference",
         "Value",
+        "Footprint",
         "instances",
         "stale",
     ] {
@@ -366,6 +440,10 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
         let context = sheet_instance_context(&child, &mut schematic).unwrap();
         let uuid = schematic.symbols.get(0).unwrap().uuid.clone();
         let symbol = schematic.symbols.get(0).unwrap();
+        let fields = sch_components::PlacementFields {
+            value: symbol.value_str().unwrap_or_default().to_string(),
+            footprint: symbol.footprint().unwrap_or_default().to_string(),
+        };
         let expected = sch_components::ComponentTargetUnit::placement(
             &uuid,
             &context,
@@ -375,14 +453,14 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
             symbol.at.rotation.unwrap_or(0.0),
             symbol.mirror.as_deref(),
             symbol.reference().unwrap(),
-            symbol.value_str(),
+            &fields,
             symbol.unit,
         );
         match missing {
             "symbol" => {
                 schematic.symbols.remove_by_uuid(&uuid).unwrap();
             }
-            "Reference" | "Value" => schematic
+            "Reference" | "Value" | "Footprint" => schematic
                 .symbols
                 .get_mut(0)
                 .unwrap()
@@ -423,11 +501,23 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
 
 #[test]
 fn native_placement_readback_requires_requested_values() {
-    for mismatch in ["unit", "lib_id", "x", "y", "rotation", "Value"] {
+    for mismatch in ["unit", "lib_id", "x", "y", "rotation", "Value", "Footprint"] {
         let (_directory, _root, child) = fixture(true);
         let mut schematic = Schematic::load(&child).unwrap();
         let context = sheet_instance_context(&child, &mut schematic).unwrap();
         let symbol = schematic.symbols.get(0).unwrap();
+        let fields = sch_components::PlacementFields {
+            value: if mismatch == "Value" {
+                "wrong-value".to_string()
+            } else {
+                symbol.value_str().unwrap_or_default().to_string()
+            },
+            footprint: if mismatch == "Footprint" {
+                "wrong:footprint".to_string()
+            } else {
+                symbol.footprint().unwrap_or_default().to_string()
+            },
+        };
         let expected = sch_components::ComponentTargetUnit::placement(
             &symbol.uuid,
             &context,
@@ -441,11 +531,7 @@ fn native_placement_readback_requires_requested_values() {
             symbol.at.rotation.unwrap_or(0.0) + if mismatch == "rotation" { 90.0 } else { 0.0 },
             symbol.mirror.as_deref(),
             symbol.reference().unwrap(),
-            if mismatch == "Value" {
-                Some("wrong-value")
-            } else {
-                symbol.value_str()
-            },
+            &fields,
             symbol.unit + u32::from(mismatch == "unit"),
         );
         let committed = Schematic::load(&child).unwrap();

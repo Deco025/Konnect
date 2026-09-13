@@ -70,7 +70,8 @@ pub fn tools() -> Vec<ToolDef> {
             "batch_place_components",
             "Place multiple symbols from KiCAD libraries in one write with committed-file \
              readback. Preserves every saved hierarchy instance and preflights stale metadata \
-             before any placement. \
+             before any placement. Copies each library Value and Footprint unless that entry \
+             explicitly overrides it. \
              Pass explicit references -- there is no auto-numbering; an omitted reference \
              becomes '?' like an eeschema-unannotated symbol, same as add_schematic_component.",
             json!({
@@ -88,6 +89,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
                                 "reference": { "type": "string" },
                                 "value": { "type": "string" },
+                                "footprint": { "type": "string" },
                                 "unit": { "type": "integer", "default": 1 }
                             },
                             "required": ["lib_id", "x", "y"]
@@ -530,6 +532,7 @@ async fn handle_batch_place_components(
         };
         let reference = comp["reference"].as_str().unwrap_or("?");
         let value = comp["value"].as_str();
+        let footprint = comp["footprint"].as_str();
         let unit = comp["unit"].as_f64().unwrap_or(1.0) as u32;
 
         match place_one_component(
@@ -543,14 +546,23 @@ async fn handle_batch_place_components(
             mirror,
             reference,
             value,
+            footprint,
             unit,
             &src,
         ) {
-            Ok(uuid) => {
+            Ok(placed) => {
                 let (expected_x, expected_y) = snap_point(x, y, 1.27);
                 placements.push(super::sch_components::ComponentTargetUnit::placement(
-                    &uuid, &context, lib_id, expected_x, expected_y, rotation, mirror, reference,
-                    value, unit,
+                    &placed.uuid,
+                    &context,
+                    lib_id,
+                    expected_x,
+                    expected_y,
+                    rotation,
+                    mirror,
+                    reference,
+                    &placed.fields,
+                    unit,
                 ));
             }
             Err(e) => errors.push(error_text(&e)),
@@ -1902,6 +1914,7 @@ mod batch_place_and_connect_tests {
     // Pre-seed lib_symbols so ensure_lib_symbol short-circuits without KiCad
     // (precedent: sch_components.rs add_schematic_component_hides_power_reference).
     const DEVICE_R: &str = "    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 0 0 0))\n      (property \"Value\" \"R\" (at 0 0 0))\n    )\n";
+    const DEVICE_WITH_DEFAULTS: &str = "    (symbol \"Device:WITH_DEFAULTS\"\n      (property \"Reference\" \"U\" (at 0 0 0))\n      (property \"Value\" \"Library Default\" (at 0 0 0))\n      (property \"Footprint\" \"Package_DIP:DIP-8_W7.62mm\" (at 0 0 0) hide)\n    )\n";
 
     fn seeded_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -1909,7 +1922,7 @@ mod batch_place_and_connect_tests {
         std::fs::write(
             &path,
             format!(
-                "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n{DEVICE_R}  )\n)\n"
+                "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n{DEVICE_R}{DEVICE_WITH_DEFAULTS}  )\n)\n"
             ),
         )
         .unwrap();
@@ -1948,6 +1961,39 @@ mod batch_place_and_connect_tests {
                 .lines()
                 .any(|line| line.ends_with(' ') || line.ends_with('\t')),
             "batch placement must not leave trailing whitespace: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_placement_uses_library_fields_and_per_entry_overrides() {
+        let (_d, path) = seeded_schematic();
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": path.display().to_string(),
+                "components": [
+                    { "lib_id": "Device:WITH_DEFAULTS", "x": 100.0, "y": 100.0, "reference": "U1" },
+                    { "lib_id": "Device:WITH_DEFAULTS", "x": 120.0, "y": 100.0, "reference": "U2",
+                      "value": "Explicit Value", "footprint": "Package_DIP:DIP-14_W7.62mm" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected JSON text")
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["placed"][0]["fields"]["Value"], "Library Default");
+        assert_eq!(
+            response["placed"][0]["fields"]["Footprint"],
+            "Package_DIP:DIP-8_W7.62mm"
+        );
+        assert_eq!(response["placed"][1]["fields"]["Value"], "Explicit Value");
+        assert_eq!(
+            response["placed"][1]["fields"]["Footprint"],
+            "Package_DIP:DIP-14_W7.62mm"
         );
     }
 

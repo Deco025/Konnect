@@ -3,6 +3,29 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: placement preserves library Value and Footprint (minor release)
+
+`add_schematic_component`, every entry of `batch_place_components`, and
+`add_power_symbol` now copy the resolved library symbol's `Value` and
+`Footprint` onto the placed instance (#506). Previously, placement derived
+`Value` from the name after `:` in `lib_id` and always wrote an empty
+`Footprint`, even when the embedded library definition already carried both.
+KiCad's netlister reads the instance fields and does not fall back to that
+embedded definition, so the old result could have the wrong value and no
+`(footprint …)` node downstream.
+
+The single and batch placement schemas gain optional `footprint` arguments.
+Explicit `value` and `footprint` values win over the library defaults. An
+explicit empty `footprint` therefore clears a library assignment. A library
+whose Footprint is genuinely empty, such as the generic `Device:R`, remains
+empty. If a malformed library omits Value, the historical symbol-name fallback
+is retained.
+
+The placed-file readback now binds and verifies both effective fields. The new
+optional arguments are backward compatible. Existing response field names are
+unchanged, but their `Value` and `Footprint` contents now match the library
+rather than Konnect's discarded defaults.
+
 ## Unreleased: Windows discovers KiCad's IPC endpoint (patch release)
 
 No tool, argument, or response field changed shape. What changes on **Windows**
