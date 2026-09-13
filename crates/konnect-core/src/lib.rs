@@ -6,6 +6,7 @@ pub mod kicad_install;
 pub mod mcp;
 pub(crate) mod native_specctra_bridge;
 pub mod observability;
+pub mod outcome;
 pub mod router;
 pub(crate) mod runtime_info;
 pub(crate) mod specctra;

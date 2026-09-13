@@ -7,6 +7,7 @@ use super::server::McpServerState;
 use crate::observability::{
     default_calls_log_path, new_call_id, unix_ms, CallObserver, CallRecord, CallStatus,
 };
+use crate::outcome::OutcomeStatus;
 use crate::router::{meta_tools, ToolRouter};
 use axum::response::sse::Event;
 use serde_json::{json, Value};
@@ -321,11 +322,7 @@ impl McpHandler {
             if name == "load_toolset" || name == "unload_toolset" {
                 self.notify_tools_list_changed().await;
             }
-            let status = if result.is_error {
-                CallStatus::Error
-            } else {
-                CallStatus::Ok
-            };
+            let status = call_status(&result);
             return (result, status, None);
         }
 
@@ -371,11 +368,7 @@ impl McpHandler {
             }
             return match (tool_def.handler)(args, self.ctx.clone()).await {
                 Ok(result) => {
-                    let status = if result.is_error {
-                        CallStatus::Error
-                    } else {
-                        CallStatus::Ok
-                    };
+                    let status = call_status(&result);
                     // Structured errors carry their own kind in the body; plain-text
                     // errors fall back to "handler_error" via extract_error_kind.
                     let error_kind = extract_error_kind(&result);
@@ -1064,6 +1057,17 @@ fn schema_argument_error(
     )
 }
 
+fn call_status(result: &CallToolResult) -> CallStatus {
+    match crate::outcome::status(result) {
+        Some(OutcomeStatus::Complete) => CallStatus::Ok,
+        Some(OutcomeStatus::Partial) => CallStatus::Partial,
+        Some(OutcomeStatus::Failed) => CallStatus::Error,
+        Some(OutcomeStatus::Uncertain) => CallStatus::Uncertain,
+        None if result.is_error => CallStatus::Error,
+        None => CallStatus::Ok,
+    }
+}
+
 /// Schema-declared input rules are a server contract, not client guidance.
 /// These cases exercise the served dispatch so a malformed present value is
 /// refused before a handler can substitute a default or touch a design file.
@@ -1092,6 +1096,37 @@ mod schema_validation_dispatch_tests {
             other => panic!("expected structured text error, got {other:?}"),
         };
         serde_json::from_str(text).unwrap_or_else(|error| panic!("{error}: {text}"))
+    }
+
+    #[test]
+    fn observer_status_distinguishes_shared_partial_and_uncertain_outcomes() {
+        let partial = crate::outcome::attach(
+            CallToolResult::json(&json!({"placed_count": 1})),
+            crate::outcome::summary(
+                OutcomeStatus::Partial,
+                "test.kicad_sch",
+                "saved_file_readback",
+                2,
+                1,
+                1,
+                None,
+            ),
+        );
+        assert_eq!(call_status(&partial), CallStatus::Partial);
+
+        let uncertain = crate::outcome::attach(
+            CallToolResult::error("{}"),
+            crate::outcome::summary(
+                OutcomeStatus::Uncertain,
+                "test.kicad_sch",
+                "saved_file_readback",
+                1,
+                0,
+                1,
+                None,
+            ),
+        );
+        assert_eq!(call_status(&uncertain), CallStatus::Uncertain);
     }
 
     async fn assert_invalid_field(handler: &McpHandler, tool: &str, args: Value, field: &str) {
