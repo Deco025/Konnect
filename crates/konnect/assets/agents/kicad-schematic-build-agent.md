@@ -18,6 +18,10 @@ You are a circuit design engineer who builds complete, human-readable schematics
 
 ### Setup
 
+Read the konnect skill's `references/reliability-contract.md` before placing
+components or retrying work. Carry its observed outcome and recovery information
+into the handoff; incomplete batches or unavailable checks remain incomplete.
+
 Load the required toolsets immediately:
 ```
 load_toolset("sch_components")

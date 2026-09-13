@@ -35,6 +35,22 @@ Write "No public compatibility impact" when applicable.
 
 ## Validation
 
+### Changed tool behavior
+
+<!-- Complete for affected tool behavior using docs/RELIABILITY_CONTRACT.md.
+Keep answers short. Remove this table for documentation-only/mechanical changes;
+mark individual inapplicable rows with a reason. Do not invent runtime evidence.
+-->
+
+| Behavior | Contract and evidence for this change |
+|---|---|
+| Accepted inputs and declared defaults | |
+| Invalid/unsupported inputs and structured errors | |
+| Target, data source and prerequisite state | |
+| Observed changes and preserved unrelated objects | |
+| Failure before/after mutation, including applied work | |
+| Recovery from partial/uncertain results without repeating applied work | |
+
 <!-- Paste the exact commands and results. Note environment-dependent checks not run and why. -->
 
 - [ ] `cargo fmt --all -- --check`
@@ -53,7 +69,7 @@ Write "No public compatibility impact" when applicable.
 - [ ] New names follow `docs/NAMING_CONVENTIONS.md`; public renames include compatibility handling.
 - [ ] New behavior and failure paths have regression coverage.
 - [ ] File mutations are atomic and preserve unrelated content.
-- [ ] IPC mutations verify the requested board and do not leave partial batches.
+- [ ] IPC mutations verify the requested board; atomic/partial behavior and safe recovery are explicit under the reliability contract.
 - [ ] If tools were added/removed: counts and docs updated per CONTRIBUTING.md (registry `tool_count`, `tool-directory.md`, DEV.md stats, README count).
 
 ## Maintainer merge state

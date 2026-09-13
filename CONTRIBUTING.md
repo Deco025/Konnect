@@ -64,6 +64,13 @@ new tool.
 
 ## Pull request shape
 
+When changing a tool's behavior, follow the
+[reliability contract](docs/RELIABILITY_CONTRACT.md) and complete the affected
+behavior table in the PR template. It covers input/default handling, target and
+source, observed results, failure timing, and safe recovery. Apply it to the
+change under review; unrelated legacy migrations are separate work. The contract
+distinguishes review requirements from automation still being implemented.
+
 Use an imperative title such as `fix(schematic): preserve tab-indented wire blocks`.
 The description should state:
 
