@@ -9,6 +9,17 @@ use crate::mcp::protocol::{CallToolResult, ToolContent};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+/// Tools that have adopted the shared outcome envelope.
+///
+/// Keep this deliberately bounded. Adding a tool is a contract migration: its
+/// success, refusal, partial and post-mutation failure paths need evidence
+/// before it belongs here.
+pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
+    "add_schematic_component",
+    "batch_place_components",
+    "run_design_review",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeStatus {
@@ -113,6 +124,116 @@ pub fn status(result: &CallToolResult) -> Option<OutcomeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    const LEGACY_BASELINE_CEILING: usize = 3;
+
+    #[derive(Debug, Deserialize)]
+    struct ReliabilityBaseline {
+        schema_version: u32,
+        adopted_outcome_tools: Vec<String>,
+        legacy_entry_ceiling: usize,
+        legacy_entries: Vec<LegacyEntry>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyEntry {
+        id: String,
+        paths: Vec<String>,
+        rationale: String,
+        tracking_issues: Vec<String>,
+        removal_criteria: String,
+    }
+
+    #[test]
+    fn reliability_contract_inventory_is_reviewed_and_bounded() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let inventory_path = root.join("docs/reliability-legacy-inventory.json");
+        let bytes = std::fs::read(&inventory_path).unwrap_or_else(|error| {
+            panic!(
+                "reliability inventory {} must be tracked: {error}",
+                inventory_path.display()
+            )
+        });
+        let baseline: ReliabilityBaseline = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("{}: {error}", inventory_path.display()));
+
+        assert_eq!(baseline.schema_version, 1, "unknown inventory schema");
+        assert_eq!(
+            baseline.legacy_entry_ceiling, LEGACY_BASELINE_CEILING,
+            "raising tolerated legacy debt requires an explicit guard review"
+        );
+        assert_eq!(
+            baseline.legacy_entries.len(),
+            baseline.legacy_entry_ceiling,
+            "the ceiling must ratchet down when legacy debt is removed; new debt must not be hidden below an old ceiling"
+        );
+
+        let mut adopted = baseline.adopted_outcome_tools;
+        adopted.sort();
+        let mut expected = ADOPTED_OUTCOME_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            adopted, expected,
+            "inventory and the code-owned outcome catalogue drifted"
+        );
+        for tool in ADOPTED_OUTCOME_TOOLS {
+            assert!(
+                crate::router::registry::ALL_TOOLSETS.iter().any(|toolset| {
+                    crate::router::registry::tools_for(toolset.name)
+                        .is_some_and(|definitions| definitions.iter().any(|def| def.name == *tool))
+                }),
+                "adopted outcome tool is no longer served: {tool}"
+            );
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        for entry in baseline.legacy_entries {
+            assert!(!entry.id.trim().is_empty(), "legacy entry needs an id");
+            assert!(ids.insert(entry.id.clone()), "duplicate id: {}", entry.id);
+            assert!(
+                !entry.paths.is_empty(),
+                "{} needs at least one path",
+                entry.id
+            );
+            assert!(
+                !entry.rationale.trim().is_empty(),
+                "{} needs a rationale",
+                entry.id
+            );
+            assert!(
+                !entry.removal_criteria.trim().is_empty(),
+                "{} needs removal criteria",
+                entry.id
+            );
+            assert!(
+                !entry.tracking_issues.is_empty(),
+                "{} needs a tracking issue",
+                entry.id
+            );
+            for issue in entry.tracking_issues {
+                assert!(
+                    issue.starts_with("https://github.com/mixelpixx/Konnect/issues/")
+                        && issue
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|number| number.parse::<u64>().is_ok()),
+                    "{} has an invalid issue URL: {issue}",
+                    entry.id
+                );
+            }
+            for path in entry.paths {
+                assert!(
+                    root.join(&path).is_file(),
+                    "{} names a stale or missing path: {path}",
+                    entry.id
+                );
+            }
+        }
+    }
 
     #[test]
     fn attach_preserves_legacy_fields_and_exposes_status() {

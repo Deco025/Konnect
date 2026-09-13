@@ -31,6 +31,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check
         run: cargo check --workspace --locked
+      # Fast, named contract gate for the adopted outcome catalogue and the
+      # reviewed legacy-debt ratchet. The full test step below remains the
+      # regression gate; this makes contract drift immediately identifiable.
+      - name: Reliability contract
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p konnect-core --locked reliability_contract -- --nocapture
       - name: Test (unit + integration)
         run: cargo test --workspace --locked --lib --tests
       # --doc cannot be combined with --lib/--tests; doctests broke silently

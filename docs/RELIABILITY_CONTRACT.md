@@ -75,7 +75,10 @@ Do not claim all-or-nothing behavior when the backend cannot provide it.
 The shared `outcome` envelope is initially implemented only for
 `add_schematic_component`, `batch_place_components`, and `run_design_review`.
 That pilot is intentionally bounded. The following adjacent paths retain their
-existing response contracts until their focused issues are resolved:
+existing response contracts until their focused issues are resolved. The
+machine-checked source of this baseline is
+[`reliability-legacy-inventory.json`](reliability-legacy-inventory.json); the
+table below is its human-readable explanation.
 
 | Area | Current gap | Tracking | Removal condition |
 |---|---|---|---|
@@ -121,14 +124,16 @@ is separate from this policy:
 | [#551](https://github.com/mixelpixx/Konnect/pull/551) | Compiled/cached Draft 2020-12 validation for domain and meta-tools, catalogue conformance, checked unit handling, and positive sheet dimensions; coordinated with #546/#547/#543 |
 | [#552](https://github.com/mixelpixx/Konnect/pull/552) | Shared, lifecycle-owned `inproc://` IPC test fixture; migrates the five racy mocks from #544 and covers readiness, concurrency, repeated use, and cleanup after success or responder failure |
 | [#553](https://github.com/mixelpixx/Konnect/pull/553) | Shared outcomes and initial handler/observer migration |
-| [#554](https://github.com/mixelpixx/Konnect/pull/554) | Automated enforcement with an explicit legacy inventory |
+| [#554](https://github.com/mixelpixx/Konnect/pull/554) | Named CI gate for the adopted outcome catalogue, served-dispatch outcome preservation, and a reviewed three-entry legacy-debt ratchet |
 
 The dispatch compiles, caches, and enforces every advertised tool schema before
 the handler runs. Handlers still own domain rules and checked direct-call paths.
-Uniform outcome fields and the planned CI baseline are not established by this
-document. As follow-ups land, update this section with their actual coverage.
-Baseline entries must name the path, reason, tracking issue and removal
-criterion; never silently add new regressions to it.
+The CI gate checks that the outcome pilot remains served through the catalogue,
+that its envelope survives the JSON-RPC `tools/call` path, and that every legacy
+entry names existing paths, rationale, tracking issues, and removal criteria.
+The baseline ceiling is code-reviewed and must ratchet down when an entry is
+removed; adding tolerated debt requires an explicit guard change and must never
+be generated automatically.
 
 Contributors may use any AI or none. Share the behavioral contract while retaining
 independent toolchain instructions and reviews. This contract specifies outcomes,
