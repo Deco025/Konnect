@@ -101,16 +101,17 @@ is separate from this policy:
 
 | Follow-up | Planned automation or implementation |
 |---|---|
-| [#551](https://github.com/mixelpixx/Konnect/pull/551) | Shared schema validation and catalogue conformance, coordinated with #546/#547/#543 |
+| [#551](https://github.com/mixelpixx/Konnect/pull/551) | Compiled/cached Draft 2020-12 validation for domain and meta-tools, catalogue conformance, checked unit handling, and positive sheet dimensions; coordinated with #546/#547/#543 |
 | [#552](https://github.com/mixelpixx/Konnect/pull/552) | Reusable IPC mock fixtures, including #544 |
 | [#553](https://github.com/mixelpixx/Konnect/pull/553) | Shared outcomes and initial handler/observer migration |
 | [#554](https://github.com/mixelpixx/Konnect/pull/554) | Automated enforcement with an explicit legacy inventory |
 
-The dispatch currently checks required-property presence; handlers still own
-other validation. Uniform outcome fields and the planned conformance/baseline
-checks are not established by this document. As follow-ups land, update this
-section with their actual coverage. Baseline entries must name the path, reason,
-tracking issue and removal criterion; never silently add new regressions to it.
+The dispatch compiles, caches, and enforces every advertised tool schema before
+the handler runs. Handlers still own domain rules and checked direct-call paths.
+Uniform outcome fields and the planned CI baseline are not established by this
+document. As follow-ups land, update this section with their actual coverage.
+Baseline entries must name the path, reason, tracking issue and removal
+criterion; never silently add new regressions to it.
 
 Contributors may use any AI or none. Share the behavioral contract while retaining
 independent toolchain instructions and reviews. This contract specifies outcomes,
