@@ -1200,6 +1200,7 @@ async fn handle_run_design_review(
                     "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),
                 }));
                 let mut drc = AuditAggregate::new("drc");
+                drc.requested += 1;
                 drc.completed += 1;
                 drc.findings.extend(report.all().map(|violation| {
                     json!({
@@ -1288,42 +1289,71 @@ async fn handle_run_design_review(
         "LOOKS GOOD — no critical issues found"
     };
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "design_review": {
-                "status": status,
-                "verdict": verdict,
-                "errors": error_count,
-                "warnings": warning_count,
-                "info": info_count,
-                "severity_filter": severity_filter,
-                "findings": all_findings,
-                "audits": audit_summaries,
-                "coverage": {
-                    "schematic": {
-                        "sheet_instances": schematic_coverage.sheet_instances,
-                        "schematic_files": schematic_coverage.schematic_files,
-                        "symbol_instances": schematic_coverage.symbol_instances,
-                        "resolved_symbols": schematic_coverage.resolved_symbols,
-                        "unresolved_symbols": schematic_coverage.unresolved_symbols,
-                        "named_nets": schematic_coverage.named_nets,
-                        "multi_unit_symbols": schematic_coverage.multi_unit_symbols
-                    },
-                    "board": board_coverage.map(|coverage| json!({
-                        "footprints": coverage.footprints,
-                        "pads": coverage.pads,
-                        "named_nets": coverage.named_nets
-                    }))
-                },
-                // Null when no board was supplied, or when DRC could not run
-                // — in the latter case `diagnostics` says so and the verdict
-                // is INCOMPLETE. Never zero: this review must not be able to
-                // imply a clean board it did not check.
-                "drc": drc_summary,
-                "diagnostics": diagnostics
-            }
+    let requested_audits = audits.iter().map(|audit| audit.requested).sum::<usize>();
+    let retry = if status == "complete" {
+        None
+    } else {
+        Some(json!({
+            "safe": true,
+            "scope": "failed_checks",
+            "instruction": "rerun only the unavailable or failed checks after resolving their diagnostics"
         }))
-        .unwrap(),
+    };
+    let outcome_status = match status {
+        "complete" => crate::outcome::OutcomeStatus::Complete,
+        "partial" => crate::outcome::OutcomeStatus::Partial,
+        _ => crate::outcome::OutcomeStatus::Failed,
+    };
+    let mut outcome = crate::outcome::summary(
+        outcome_status,
+        root_path.display().to_string(),
+        "saved_schematic_hierarchy_and_optional_saved_board",
+        requested_audits,
+        completed_audits,
+        failed_audits,
+        retry,
+    );
+    outcome["diagnostic_count"] = json!(diagnostics.len());
+
+    Ok(crate::outcome::attach(
+        CallToolResult::text(
+            serde_json::to_string(&json!({
+                "design_review": {
+                    "status": status,
+                    "verdict": verdict,
+                    "errors": error_count,
+                    "warnings": warning_count,
+                    "info": info_count,
+                    "severity_filter": severity_filter,
+                    "findings": all_findings,
+                    "audits": audit_summaries,
+                    "coverage": {
+                        "schematic": {
+                            "sheet_instances": schematic_coverage.sheet_instances,
+                            "schematic_files": schematic_coverage.schematic_files,
+                            "symbol_instances": schematic_coverage.symbol_instances,
+                            "resolved_symbols": schematic_coverage.resolved_symbols,
+                            "unresolved_symbols": schematic_coverage.unresolved_symbols,
+                            "named_nets": schematic_coverage.named_nets,
+                            "multi_unit_symbols": schematic_coverage.multi_unit_symbols
+                        },
+                        "board": board_coverage.map(|coverage| json!({
+                            "footprints": coverage.footprints,
+                            "pads": coverage.pads,
+                            "named_nets": coverage.named_nets
+                        }))
+                    },
+                    // Null when no board was supplied, or when DRC could not run
+                    // — in the latter case `diagnostics` says so and the verdict
+                    // is INCOMPLETE. Never zero: this review must not be able to
+                    // imply a clean board it did not check.
+                    "drc": drc_summary,
+                    "diagnostics": diagnostics
+                }
+            }))
+            .unwrap(),
+        ),
+        outcome,
     ))
 }
 
@@ -2137,6 +2167,8 @@ mod review_completion_tests {
         let result = review(&root, None).await;
         let report = &result["design_review"];
         assert_eq!(report["status"], "complete");
+        assert_eq!(result["outcome"]["status"], "complete");
+        assert_eq!(result["outcome"]["target"], root.display().to_string());
         assert_eq!(report["verdict"], "LOOKS GOOD — no critical issues found");
         assert_eq!(report["coverage"]["schematic"]["symbol_instances"], 1);
         assert_eq!(report["coverage"]["schematic"]["named_nets"], 1);
@@ -2241,6 +2273,9 @@ mod review_completion_tests {
         let report = &result["design_review"];
 
         assert_eq!(report["status"], "partial");
+        assert_eq!(result["outcome"]["status"], "partial");
+        assert_eq!(result["outcome"]["retry"]["scope"], "failed_checks");
+        assert!(result["outcome"]["diagnostic_count"].as_u64().unwrap() > 0);
         assert_eq!(
             report["verdict"],
             "INCOMPLETE — review could not evaluate the full design"

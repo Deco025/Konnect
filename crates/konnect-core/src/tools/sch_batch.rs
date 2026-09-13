@@ -21,7 +21,7 @@ use konnect_sexp::{
     },
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
@@ -506,14 +506,19 @@ async fn handle_batch_place_components(
 
     let mut placements = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut failures: Vec<Value> = Vec::new();
 
-    for comp in &components {
+    for (index, comp) in components.iter().enumerate() {
         let Some(lib_id) = comp["lib_id"].as_str() else {
-            errors.push("Missing 'lib_id' in component spec".into());
+            let message = "Missing 'lib_id' in component spec".to_string();
+            errors.push(message.clone());
+            failures.push(json!({"index": index, "kind": "invalid_item", "message": message}));
             continue;
         };
         let (Some(x), Some(y)) = (comp["x"].as_f64(), comp["y"].as_f64()) else {
-            errors.push(format!("Missing 'x'/'y' for '{}'", lib_id));
+            let message = format!("Missing 'x'/'y' for '{}'", lib_id);
+            errors.push(message.clone());
+            failures.push(json!({"index": index, "lib_id": lib_id, "kind": "invalid_item", "message": message}));
             continue;
         };
         let rotation = comp["rotation"].as_f64().unwrap_or(0.0);
@@ -523,10 +528,12 @@ async fn handle_batch_place_components(
         let mirror = match super::sch_components::mirror_arg(comp, "mirror") {
             Ok(mirror) => mirror,
             Err(_) => {
-                errors.push(format!(
+                let message = format!(
                     "Invalid 'mirror' for '{}': expected \"x\", \"y\" or \"none\"",
                     lib_id
-                ));
+                );
+                errors.push(message.clone());
+                failures.push(json!({"index": index, "lib_id": lib_id, "kind": "invalid_item", "message": message}));
                 continue;
             }
         };
@@ -536,7 +543,9 @@ async fn handle_batch_place_components(
         let unit = match opt_u32(comp, "unit") {
             Ok(unit) => unit.unwrap_or(1),
             Err(error) => {
-                errors.push(error_text(&error));
+                let message = error_text(&error);
+                errors.push(message.clone());
+                failures.push(json!({"index": index, "lib_id": lib_id, "kind": "invalid_item", "message": message}));
                 continue;
             }
         };
@@ -571,29 +580,129 @@ async fn handle_batch_place_components(
                     unit,
                 ));
             }
-            Err(e) => errors.push(error_text(&e)),
+            Err(error) => {
+                let kind = crate::mcp::error::extract_error_kind(&error)
+                    .unwrap_or_else(|| "placement_failed".to_string());
+                let message = error_text(&error);
+                errors.push(message.clone());
+                failures.push(json!({
+                    "index": index,
+                    "lib_id": lib_id,
+                    "reference": reference,
+                    "kind": kind,
+                    "message": message
+                }));
+            }
         }
     }
 
     let mut placed = Vec::new();
     if !placements.is_empty() {
-        sch.overwrite()?;
-        let committed = cse::Schematic::load(&sch_path)?;
+        if let Err(error) = sch.overwrite() {
+            let result = super::mutation_outcome_uncertain(
+                &sch_path,
+                "batch_place_components",
+                format!("schematic persistence failed: {error}"),
+            );
+            return Ok(crate::outcome::attach(
+                result,
+                crate::outcome::summary(
+                    crate::outcome::OutcomeStatus::Uncertain,
+                    sch_path.display().to_string(),
+                    "saved_file_readback",
+                    components.len(),
+                    0,
+                    components.len(),
+                    Some(crate::outcome::inspect_before_retry()),
+                ),
+            ));
+        }
+        let committed = match super::sch_components::load_committed_component_schematic(&sch_path) {
+            Ok(committed) => committed,
+            Err(error) => {
+                let result = super::mutation_outcome_uncertain(
+                    &sch_path,
+                    "batch_place_components",
+                    format!("saved schematic could not be reloaded: {error}"),
+                );
+                return Ok(crate::outcome::attach(
+                    result,
+                    crate::outcome::summary(
+                        crate::outcome::OutcomeStatus::Uncertain,
+                        sch_path.display().to_string(),
+                        "saved_file_readback",
+                        components.len(),
+                        0,
+                        components.len(),
+                        Some(crate::outcome::inspect_before_retry()),
+                    ),
+                ));
+            }
+        };
         for placement in &placements {
             match placed_component_readback(&sch_path, &committed, placement, &context) {
                 Ok(result) => placed.push(result),
-                Err(error) => return Ok(error),
+                Err(error) => {
+                    let reason = error_text(&error);
+                    let uncertain = super::mutation_outcome_uncertain(
+                        &sch_path,
+                        "batch_place_components",
+                        format!("saved placement readback failed: {reason}"),
+                    );
+                    return Ok(crate::outcome::attach(
+                        uncertain,
+                        crate::outcome::summary(
+                            crate::outcome::OutcomeStatus::Uncertain,
+                            sch_path.display().to_string(),
+                            "saved_file_readback",
+                            components.len(),
+                            placed.len(),
+                            components.len().saturating_sub(placed.len()),
+                            Some(crate::outcome::inspect_before_retry()),
+                        ),
+                    ));
+                }
             }
         }
     }
 
+    let status = if failures.is_empty() {
+        crate::outcome::OutcomeStatus::Complete
+    } else if placed.is_empty() {
+        crate::outcome::OutcomeStatus::Failed
+    } else {
+        crate::outcome::OutcomeStatus::Partial
+    };
+    let retry = match status {
+        crate::outcome::OutcomeStatus::Complete => None,
+        crate::outcome::OutcomeStatus::Partial => Some(crate::outcome::retry_failed_items(
+            failures
+                .iter()
+                .filter_map(|failure| failure["index"].as_u64().map(|index| index as usize))
+                .collect(),
+        )),
+        crate::outcome::OutcomeStatus::Failed => Some(crate::outcome::retry_whole_request()),
+        crate::outcome::OutcomeStatus::Uncertain => unreachable!(),
+    };
     let mut result = CallToolResult::json(&json!({
         "placed": placed,
         "placed_count": placed.len(),
-        "errors": errors
+        "errors": errors,
+        "failures": failures
     }));
     result.is_error = placed.is_empty() && !errors.is_empty();
-    Ok(result)
+    Ok(crate::outcome::attach(
+        result,
+        crate::outcome::summary(
+            status,
+            sch_path.display().to_string(),
+            "saved_file_readback",
+            components.len(),
+            placed.len(),
+            failures.len(),
+            retry,
+        ),
+    ))
 }
 
 async fn handle_batch_connect_pins(
@@ -2028,6 +2137,13 @@ mod batch_place_and_connect_tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["placed_count"], 2);
         assert_eq!(parsed["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["failures"][0]["index"], 1);
+        assert_eq!(parsed["outcome"]["status"], "partial");
+        assert_eq!(parsed["outcome"]["requested"], 3);
+        assert_eq!(parsed["outcome"]["completed"], 2);
+        assert_eq!(parsed["outcome"]["failed"], 1);
+        assert_eq!(parsed["outcome"]["retry"]["scope"], "failed_items");
+        assert_eq!(parsed["outcome"]["retry"]["item_indexes"], json!([1]));
 
         let sch = cse::Schematic::load(&path).unwrap();
         assert!(sch.symbols.by_reference("R1").is_some());
@@ -2080,6 +2196,7 @@ mod batch_place_and_connect_tests {
     #[tokio::test]
     async fn batch_place_components_total_failure_sets_is_error() {
         let (_d, path) = seeded_schematic();
+        let before = std::fs::read(&path).unwrap();
         let result = handle_batch_place_components(
             &json!({
                 "schematic": path.display().to_string(),
@@ -2092,6 +2209,14 @@ mod batch_place_and_connect_tests {
         .await
         .unwrap();
         assert!(result.is_error, "{result:?}");
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            _ => panic!("expected text"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["outcome"]["status"], "failed");
+        assert_eq!(parsed["outcome"]["retry"]["scope"], "whole_request");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     /// Six single-pin instances of a synthetic part, positioned so that

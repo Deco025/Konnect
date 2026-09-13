@@ -547,27 +547,27 @@ async fn handle_add_schematic_component(
     let sch_path = get_path(args, "schematic")?;
     let lib_id = match require_str(args, "lib_id") {
         Ok(s) => s.to_string(),
-        Err(e) => return Ok(e),
+        Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
     let x = match require_f64(args, "x") {
         Ok(v) => v,
-        Err(e) => return Ok(e),
+        Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
     let y = match require_f64(args, "y") {
         Ok(v) => v,
-        Err(e) => return Ok(e),
+        Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
     let mirror = match mirror_arg(args, "mirror") {
         Ok(mirror) => mirror,
-        Err(e) => return Ok(e),
+        Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
     let reference = opt_str(args, "reference");
     let value = opt_str(args, "value");
     let footprint = opt_str(args, "footprint");
     let unit = match opt_u32(args, "unit") {
         Ok(unit) => unit.unwrap_or(1),
-        Err(error) => return Ok(error),
+        Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
     let ref_str = reference.unwrap_or("?");
 
@@ -581,14 +581,27 @@ async fn handle_add_schematic_component(
     // unannotated (#204).
     let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
         Ok(context) => context,
-        Err(error) => return Ok(error.into_tool_result()),
+        Err(error) => {
+            return Ok(failed_component_placement(
+                error.into_tool_result(),
+                &sch_path,
+            ))
+        }
     };
     if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
-        return Ok(error.into_tool_result());
+        return Ok(failed_component_placement(
+            error.into_tool_result(),
+            &sch_path,
+        ));
     }
     let source = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
         Ok(source) => source,
-        Err(error) => return Ok(error.into_tool_result()),
+        Err(error) => {
+            return Ok(failed_component_placement(
+                error.into_tool_result(),
+                &sch_path,
+            ))
+        }
     };
 
     let placed = match place_one_component(
@@ -607,7 +620,7 @@ async fn handle_add_schematic_component(
         &source,
     ) {
         Ok(placed) => placed,
-        Err(e) => return Ok(e),
+        Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
 
     let (expected_x, expected_y) = snap_point(x, y, 1.27);
@@ -623,24 +636,134 @@ async fn handle_add_schematic_component(
         &placed.fields,
         unit,
     );
-    sch.overwrite()?;
+    if let Err(error) = sch.overwrite() {
+        let uncertain = crate::tools::mutation_outcome_uncertain(
+            &sch_path,
+            "add_schematic_component",
+            format!("schematic persistence failed: {error}"),
+        );
+        return Ok(crate::outcome::attach(
+            uncertain,
+            crate::outcome::summary(
+                crate::outcome::OutcomeStatus::Uncertain,
+                sch_path.display().to_string(),
+                "saved_file_readback",
+                1,
+                0,
+                1,
+                Some(crate::outcome::inspect_before_retry()),
+            ),
+        ));
+    }
 
     // A pin landing mid-segment on an existing wire needs a junction dot, or
     // KiCad's netlister treats it as unconnected. Runs after the write because
     // it re-reads the saved file; `place_one_component` stays pure so the batch
     // path can do one junction pass for the whole batch instead of one per part.
-    let junctions = crate::tools::add_pin_midwire_junctions(&sch_path, ref_str)?;
-    let committed = cse::Schematic::load(&sch_path)?;
+    let junctions = match crate::tools::add_pin_midwire_junctions(&sch_path, ref_str) {
+        Ok(junctions) => junctions,
+        Err(error) => {
+            let uncertain = crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "add_schematic_component",
+                format!("post-write junction processing failed: {error}"),
+            );
+            return Ok(crate::outcome::attach(
+                uncertain,
+                crate::outcome::summary(
+                    crate::outcome::OutcomeStatus::Uncertain,
+                    sch_path.display().to_string(),
+                    "saved_file_readback",
+                    1,
+                    0,
+                    1,
+                    Some(crate::outcome::inspect_before_retry()),
+                ),
+            ));
+        }
+    };
+    let committed = match load_committed_component_schematic(&sch_path) {
+        Ok(committed) => committed,
+        Err(error) => {
+            let uncertain = crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "add_schematic_component",
+                format!("saved schematic could not be reloaded: {error}"),
+            );
+            return Ok(crate::outcome::attach(
+                uncertain,
+                crate::outcome::summary(
+                    crate::outcome::OutcomeStatus::Uncertain,
+                    sch_path.display().to_string(),
+                    "saved_file_readback",
+                    1,
+                    0,
+                    1,
+                    Some(crate::outcome::inspect_before_retry()),
+                ),
+            ));
+        }
+    };
     let mut result = match placed_component_readback(&sch_path, &committed, &placement, &context) {
         Ok(result) => result,
-        Err(error) => return Ok(error),
+        Err(error) => {
+            let uncertain = crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "add_schematic_component",
+                format!(
+                    "saved placement readback failed: {}",
+                    tool_error_summary(&error)
+                ),
+            );
+            return Ok(crate::outcome::attach(
+                uncertain,
+                crate::outcome::summary(
+                    crate::outcome::OutcomeStatus::Uncertain,
+                    sch_path.display().to_string(),
+                    "saved_file_readback",
+                    1,
+                    0,
+                    1,
+                    Some(crate::outcome::inspect_before_retry()),
+                ),
+            ));
+        }
     };
     result["junctions_added"] = json!(junctions
         .iter()
         .map(|(x, y)| json!({ "x": x, "y": y }))
         .collect::<Vec<_>>());
 
-    Ok(CallToolResult::json(&result))
+    Ok(crate::outcome::attach(
+        CallToolResult::json(&result),
+        crate::outcome::summary(
+            crate::outcome::OutcomeStatus::Complete,
+            sch_path.display().to_string(),
+            "saved_file_readback",
+            1,
+            1,
+            0,
+            None,
+        ),
+    ))
+}
+
+fn failed_component_placement(
+    result: CallToolResult,
+    schematic: &std::path::Path,
+) -> CallToolResult {
+    crate::outcome::attach(
+        result,
+        crate::outcome::summary(
+            crate::outcome::OutcomeStatus::Failed,
+            schematic.display().to_string(),
+            "preflight",
+            1,
+            0,
+            1,
+            Some(crate::outcome::retry_whole_request()),
+        ),
+    )
 }
 
 /// Read a placement `mirror` argument in eeschema's own vocabulary.
@@ -1536,6 +1659,20 @@ thread_local! {
     /// that #499 is about without altering the file on disk first.
     static COMPONENT_PROSPECTIVE_FAULT: std::cell::RefCell<Option<(String, String)>> =
         const { std::cell::RefCell::new(None) };
+    /// One-shot failure at the saved-file readback boundary. The mutation has
+    /// already committed when this is consumed.
+    static COMPONENT_COMMITTED_LOAD_FAULT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn load_committed_component_schematic(
+    path: &std::path::Path,
+) -> anyhow::Result<cse::Schematic> {
+    #[cfg(test)]
+    if let Some(reason) = COMPONENT_COMMITTED_LOAD_FAULT.with(|fault| fault.borrow_mut().take()) {
+        anyhow::bail!(reason);
+    }
+    Ok(cse::Schematic::load(path)?)
 }
 
 #[cfg(test)]
@@ -4413,6 +4550,12 @@ mod tests {
         .await
         .unwrap();
         assert!(!result.is_error);
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["outcome"]["status"], "complete");
+        assert_eq!(response["outcome"]["source"], "saved_file_readback");
 
         // Guards the fixture itself: the project sym-lib-table must win over
         // any real Device library the developer has installed, or these tests
@@ -4436,6 +4579,53 @@ mod tests {
             !raw.lines()
                 .any(|line| line.ends_with(' ') || line.ends_with('\t')),
             "component placement must not leave trailing whitespace: {raw:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_component_reports_uncertain_when_saved_readback_fails_after_write() {
+        let (dir, _env) = stub_symbol_dir();
+        let path = dir.path().join("uncertain.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({"path": path.display().to_string()}), &ctx)
+            .await
+            .unwrap();
+        COMPONENT_COMMITTED_LOAD_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some("injected saved-file readback failure".to_string());
+        });
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                "reference": "R1",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["outcome"]["status"], "uncertain");
+        assert_eq!(response["outcome"]["retry"]["safe"], false);
+        assert_eq!(response["outcome"]["retry"]["scope"], "inspect_target");
+        assert!(
+            cse::Schematic::load(&path)
+                .unwrap()
+                .symbols
+                .by_reference("R1")
+                .is_some(),
+            "the error occurs after the placement committed"
         );
     }
 

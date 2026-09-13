@@ -70,6 +70,23 @@ values presented as proof. These are review signals, not blanket bans on
 can legitimately continue; explain the fallback and expose material degradation.
 Do not claim all-or-nothing behavior when the backend cannot provide it.
 
+## Bounded migration inventory
+
+The shared `outcome` envelope is initially implemented only for
+`add_schematic_component`, `batch_place_components`, and `run_design_review`.
+That pilot is intentionally bounded. The following adjacent paths retain their
+existing response contracts until their focused issues are resolved:
+
+| Area | Current gap | Tracking | Removal condition |
+|---|---|---|---|
+| DRC entry points | `run_drc` and `get_drc_violations` duplicate policy, and save/refill ordering can leave the evidence source ambiguous. | [#119](https://github.com/mixelpixx/Konnect/issues/119), [#408](https://github.com/mixelpixx/Konnect/issues/408) | One owned DRC execution/result contract identifies source state and unavailable or partial evidence. |
+| Explicit config loading | A failed explicit plugin config can fall through to defaults and report success. | [#545](https://github.com/mixelpixx/Konnect/issues/545) | Explicit-config refusal is structured, does not start with substituted defaults, and has regression coverage. |
+| Live/file board readers | `get_layer_list` and `get_netclasses` read the saved file while sibling writers can operate on the live board. | [#542](https://github.com/mixelpixx/Konnect/issues/542) | Readers disclose and consistently select the live or saved source, with stale-file coverage. |
+
+New migrations should reuse the shared outcome type, but each remains a focused
+change with its own compatibility and failure evidence. This inventory is not a
+claim that those paths already meet the contract.
+
 ## Proportionate evidence
 
 Provide an ordinary success case and the failures material to the changed
