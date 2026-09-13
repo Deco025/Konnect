@@ -957,6 +957,60 @@ mod every_tool_enforces_its_required_arguments {
     }
 }
 
+#[cfg(test)]
+mod reliability_contract_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn reliability_contract_outcome_survives_the_served_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("review.kicad_sch");
+        std::fs::write(
+            &schematic,
+            "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t\
+             (uuid \"00000000-0000-0000-0000-000000000001\")\n\t(paper \"A4\")\n\t\
+             (lib_symbols)\n)\n",
+        )
+        .unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_design_review",
+                    "arguments": {"schematic": schematic.display().to_string()}
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+        assert!(
+            ["complete", "partial", "failed", "uncertain"]
+                .contains(&body["outcome"]["status"].as_str().unwrap_or("")),
+            "served tools/call lost the shared outcome: {body}"
+        );
+        assert_eq!(body["outcome"]["target"], schematic.display().to_string());
+    }
+}
+
 /// Turn a JSON Schema failure into Konnect's stable structured argument shape.
 /// Prefer a concrete nested leaf over an applicator (`oneOf`/`anyOf`) wrapper,
 /// and include an unexpected property's own name rather than only its parent.
