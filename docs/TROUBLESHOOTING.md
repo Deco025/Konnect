@@ -96,6 +96,58 @@ that board open and a tool still refuses, the error you get back is the tool's
 own reason — "a polygon needs at least 3 points", "requested board … is not open
 in KiCAD" — and it names what to change about the request.
 
+## KiCad is running, but `ipc_failure` says it did not answer
+
+`check_kicad_ui` and `open_project` report `ipc_failure` as
+`{ "kind", "message" }` whenever they establish why KiCad did not answer their
+Ping. It is `null` when no kind was established: the Ping succeeded with
+`AS_OK`, or
+`check_kicad_ui`'s own timeout expired first, which it reports as
+`timed_out: true`. The kind comes from the error NNG returned, so it tells
+apart cases that used to share one `false`, and each has a different fix:
+
+| `kind` | What happened | What to do |
+|---|---|---|
+| `not_configured` | No address was configured or discovered. | See ["KiCAD IPC socket path not configured"](#kicad-ipc-socket-path-not-configured). |
+| `no_listener` | Nothing is listening at the address. | Open an editor with the API enabled, and check the address against KiCad's "Listening on" line. |
+| `access_denied` | The operating system refused this account access to the endpoint. Likely a different account or a restrictive ACL. | Run Konnect as the same operating-system user as KiCad; see below. |
+| `handshake_failed` | A listener accepted the connection and did not complete NNG's handshake. | Another program holds KiCad's address ([#531](https://github.com/mixelpixx/Konnect/issues/531)). Close it, then restart KiCad so it can bind. |
+| `transport_error` | Any other dial or send failure. | Read `message`. |
+| `request_failed` | The request did not complete and may have reached the endpoint. A KiCad status in `message` (for example `AS_NOT_READY` while an editor is still loading) proves it did; a receive timeout or a malformed reply does not. | With a KiCad status: wait for the editor to finish loading, then retry. Without one: treat the endpoint as unproven and check what holds the address. |
+
+`handshake_failed` takes NNG's fixed 10-second negotiation limit to appear.
+That is longer than `check_kicad_ui`'s default 5-second budget, which then
+reports `timed_out` instead, so pass `timeout_seconds` above 10 to see it.
+
+### `access_denied` from a sandboxed AI client
+
+Some AI clients run tool commands in a sandbox under a separate
+operating-system account. On Windows, Codex does
+([#300](https://github.com/mixelpixx/Konnect/issues/300),
+[#532](https://github.com/mixelpixx/Konnect/issues/532)). The refusal itself
+proves only that the operating system denied this account. The likely cause in
+that setup: KiCad's endpoint was created by the desktop user, and a Windows
+named pipe created without an explicit security descriptor gives full control
+only to its creator and read access to everyone else, while a request needs
+both read and write. A Konnect started inside the sandbox is then refused,
+however its address is configured. A restrictive ACL on the pipe produces the
+same kind.
+
+The known workaround: run Konnect outside the sandbox, as the same user as
+KiCad, over HTTP:
+
+```toml
+# konnect.toml in the directory Konnect is started from
+transport = "http"
+http_address = "127.0.0.1:3000"
+ipc_address = "ipc://C:/Users/<you>/AppData/Local/Temp/kicad/api.sock"
+```
+
+Start `konnect` from a normal terminal and point the client at
+`http://127.0.0.1:3000/mcp`; `http://127.0.0.1:3000/health` answers `ok` while
+the server is up. Keep the address on `127.0.0.1`: the HTTP transport has no
+authentication. KiCad needs no change.
+
 ## Tools answer from the file while KiCad is open
 
 Tools that read the board IPC-first report `"source": "ipc"` or `"file"`, and a
@@ -110,7 +162,8 @@ It is not a global "IPC failed" log: the health tools (`check_kicad_ui`,
 `launch_kicad_ui`) and `get_project_info` dial KiCad directly and report the
 outcome in their own response — `ipc_responsive`, `connected` — rather than
 falling back to anything, so read those fields instead of looking for a
-warning. A KiCad that *answered and refused* is not warned about anywhere; that
+warning. `check_kicad_ui` and `open_project` also say why in `ipc_failure`
+(previous section). A KiCad that *answered and refused* is not warned about anywhere; that
 is a tool error, and it says so.
 
 ## "layer 'X' has no KiCAD board layer this build can represent"
