@@ -49,6 +49,13 @@ tests should prove request construction and failure classification; an ignored
 live test or the end-to-end workflow should prove behavior that depends on a
 running editor.
 
+IPC doubles in `konnect-core` must use the shared `test_support::MockIpcServer`.
+The returned guard owns an already-listening, process-unique `inproc://`
+endpoint and joins its worker when dropped. Retain that guard for the whole
+test. Do not discover a free TCP port by binding it, dropping the listener, and
+then asking NNG to bind the same port: another process can claim the port in
+between, making otherwise deterministic tests fail with `AddressInUse`.
+
 The Specctra import undo boundary has a manual live gate because KiCad IPC can
 create a named commit but cannot invoke the editor's Undo action. Open a
 disposable copy of
