@@ -1611,6 +1611,8 @@ async fn handle_add_power_symbol(
         return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
     let metadata = cse::library::symbol_metadata(&sch, &lib_id);
+    let placement_fields =
+        super::sch_components::PlacementFields::resolve(&lib_id, &metadata, Some(&power_net), None);
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
@@ -1653,15 +1655,22 @@ async fn handle_add_power_symbol(
     ));
     sym.properties.push(positioned(
         "Value",
-        &power_net,
+        &placement_fields.value,
         val_x,
         val_y,
         val_rot,
         false,
         anchors.value_justify,
     ));
-    sym.properties
-        .push(positioned("Footprint", "", x, y, 0.0, true, centred));
+    sym.properties.push(positioned(
+        "Footprint",
+        &placement_fields.footprint,
+        x,
+        y,
+        0.0,
+        true,
+        centred,
+    ));
     sym.properties.push(positioned(
         "Datasheet",
         &metadata.datasheet,
@@ -1700,7 +1709,7 @@ async fn handle_add_power_symbol(
         // and the readback asserts nothing put a reflection on it.
         None,
         &pwr_ref,
-        Some(&power_net),
+        &placement_fields,
         1,
     );
     sch.add_symbol(sym);
@@ -3496,7 +3505,7 @@ mod power_symbol_tests {
         let path = dir.path().join("power-metadata.kicad_sch");
         std::fs::write(
             &path,
-            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n      (property \"Datasheet\" \"https://example.com/gnd.pdf\" (at 0 0 0))\n      (property \"Description\" \"Ground power symbol\" (at 0 0 0))\n    )\n  )\n)\n",
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n      (property \"Footprint\" \"Test:Power_Point\" (at 0 0 0))\n      (property \"Datasheet\" \"https://example.com/gnd.pdf\" (at 0 0 0))\n      (property \"Description\" \"Ground power symbol\" (at 0 0 0))\n    )\n  )\n)\n",
         )
         .unwrap();
 
@@ -3519,6 +3528,11 @@ mod power_symbol_tests {
             .iter()
             .find(|s| s.reference() == Some("#PWR001"))
             .expect("power symbol instance");
+        assert_eq!(
+            sym.footprint(),
+            Some("Test:Power_Point"),
+            "power-symbol placement must not discard a library footprint"
+        );
         assert_eq!(
             sym.properties
                 .iter()

@@ -89,7 +89,8 @@ pub fn tools() -> Vec<ToolDef> {
             "add_schematic_component",
             "Add a symbol from a KiCAD library to the schematic. The symbol is snapped \
              to the 1.27mm schematic grid. Preserves every saved hierarchy instance, reports \
-             committed-file readback, and refuses stale instance metadata before writing. \
+             committed-file readback, copies the library Value and Footprint unless explicitly \
+             overridden, and refuses stale instance metadata before writing. \
              Specify position in schematic mm coordinates.",
             json!({
                 "type": "object",
@@ -101,7 +102,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
                     "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
                     "reference": { "type": "string", "description": "Optional override for reference designator" },
-                    "value": { "type": "string", "description": "Optional override for value field" },
+                    "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
+                    "footprint": { "type": "string", "description": "Optional override for the library symbol's Footprint" },
                     "unit": { "type": "integer", "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 }
                 },
                 "required": ["schematic", "lib_id", "x", "y"]
@@ -562,6 +564,7 @@ async fn handle_add_schematic_component(
     };
     let reference = opt_str(args, "reference");
     let value = opt_str(args, "value");
+    let footprint = opt_str(args, "footprint");
     let unit = opt_f64(args, "unit").unwrap_or(1.0) as u32;
     let ref_str = reference.unwrap_or("?");
 
@@ -585,7 +588,7 @@ async fn handle_add_schematic_component(
         Err(error) => return Ok(error.into_tool_result()),
     };
 
-    let uuid = match place_one_component(
+    let placed = match place_one_component(
         &mut sch,
         &context.instance_paths,
         &context.project_name,
@@ -596,16 +599,26 @@ async fn handle_add_schematic_component(
         mirror,
         ref_str,
         value,
+        footprint,
         unit,
         &source,
     ) {
-        Ok(uuid) => uuid,
+        Ok(placed) => placed,
         Err(e) => return Ok(e),
     };
 
     let (expected_x, expected_y) = snap_point(x, y, 1.27);
     let placement = ComponentTargetUnit::placement(
-        &uuid, &context, &lib_id, expected_x, expected_y, rotation, mirror, ref_str, value, unit,
+        &placed.uuid,
+        &context,
+        &lib_id,
+        expected_x,
+        expected_y,
+        rotation,
+        mirror,
+        ref_str,
+        &placed.fields,
+        unit,
     );
     sch.overwrite()?;
 
@@ -675,18 +688,19 @@ pub(crate) fn place_one_component(
     mirror: Option<&str>,
     reference: &str,
     value: Option<&str>,
+    footprint: Option<&str>,
     unit: u32,
     src: &dyn cse::library::SymbolLibrarySource,
-) -> Result<String, CallToolResult> {
+) -> Result<PlacedComponent, CallToolResult> {
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
-    let val_str = value.unwrap_or(lib_id.split(':').next_back().unwrap_or("?"));
 
     // Embed the library symbol definition
     if !cse::library::ensure_lib_symbol(sch, lib_id, src) {
         return Err(crate::tools::lib_symbol_not_found_error(lib_id, src));
     }
     let metadata = cse::library::symbol_metadata(sch, lib_id);
+    let fields = PlacementFields::resolve(lib_id, &metadata, value, footprint);
 
     // Validate the unit against the resolved symbol BEFORE writing anything:
     // eeschema silently renders an out-of-range unit as unit 1 and the
@@ -707,10 +721,10 @@ pub(crate) fn place_one_component(
 
     // Reference and Value go where the library anchors them, carried through
     // the placement transform so they follow a rotated body (#101);
-    // Footprint/Datasheet/Description stay hidden at the origin. KiCad copies
-    // Datasheet and Description from the resolved library symbol onto every
-    // placed instance; without those copies its BOM exporter leaves both
-    // columns blank even though lib_symbols still carries the values (#226).
+    // Footprint/Datasheet/Description stay hidden at the origin. KiCad reads
+    // Value, Footprint, Datasheet and Description from the placed instance,
+    // not as a fallback from lib_symbols; every library-owned default must be
+    // copied even though the embedded definition carries it (#226, #506).
     // Power symbols get their Reference hidden too, matching eeschema: a
     // #PWR designator is never shown on the sheet.
     let hide_reference = lib_id.starts_with("power:") || reference.starts_with("#PWR");
@@ -743,15 +757,22 @@ pub(crate) fn place_one_component(
     ));
     sym.properties.push(positioned(
         "Value",
-        val_str,
+        &fields.value,
         val_x,
         val_y,
         val_rot,
         false,
         anchors.value_justify,
     ));
-    sym.properties
-        .push(positioned("Footprint", "", x, y, 0.0, true, centred));
+    sym.properties.push(positioned(
+        "Footprint",
+        &fields.footprint,
+        x,
+        y,
+        0.0,
+        true,
+        centred,
+    ));
     sym.properties.push(positioned(
         "Datasheet",
         &metadata.datasheet,
@@ -780,7 +801,42 @@ pub(crate) fn place_one_component(
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
 
-    Ok(uuid)
+    Ok(PlacedComponent { uuid, fields })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlacementFields {
+    pub(crate) value: String,
+    pub(crate) footprint: String,
+}
+
+impl PlacementFields {
+    /// Resolve the instance-owned placement fields once for both the writer
+    /// and the committed-file intent check. Explicit tool arguments win over
+    /// the library; a malformed library missing Value keeps the historical
+    /// symbol-name fallback.
+    pub(crate) fn resolve(
+        lib_id: &str,
+        metadata: &cse::library::SymbolMetadata,
+        value: Option<&str>,
+        footprint: Option<&str>,
+    ) -> Self {
+        let library_value = if metadata.value.is_empty() {
+            lib_id.split(':').next_back().unwrap_or("?")
+        } else {
+            &metadata.value
+        };
+        Self {
+            value: value.unwrap_or(library_value).to_owned(),
+            footprint: footprint.unwrap_or(&metadata.footprint).to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlacedComponent {
+    pub(crate) uuid: String,
+    pub(crate) fields: PlacementFields,
 }
 
 #[derive(Debug, Clone)]
@@ -810,7 +866,7 @@ impl ComponentTargetUnit {
         rotation: f64,
         mirror: Option<&str>,
         reference: &str,
-        value: Option<&str>,
+        fields: &PlacementFields,
         unit: u32,
     ) -> Self {
         let mut instances = context
@@ -829,12 +885,8 @@ impl ComponentTargetUnit {
             mirror: mirror.map(str::to_owned),
             fields: BTreeMap::from([
                 ("Reference".to_owned(), reference.to_owned()),
-                (
-                    "Value".to_owned(),
-                    value
-                        .unwrap_or_else(|| lib_id.rsplit(':').next().unwrap_or(lib_id))
-                        .to_owned(),
-                ),
+                ("Value".to_owned(), fields.value.clone()),
+                ("Footprint".to_owned(), fields.footprint.clone()),
             ]),
             instances,
         }
@@ -4097,6 +4149,13 @@ mod tests {
         };
         std::fs::write(symdir.join("R.kicad_sym"), symbol("R")).unwrap();
         std::fs::write(symdir.join("C_Polarized.kicad_sym"), symbol("C_Polarized")).unwrap();
+        std::fs::write(
+            symdir.join("WITH_DEFAULTS.kicad_sym"),
+            format!(
+                "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"eeschema\")\n\t(symbol \"WITH_DEFAULTS\"\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"Library Default\" (at 0 0 0))\n\t\t(property \"Footprint\" \"Package_DIP:DIP-8_W7.62mm\" (at 0 0 0) hide)\n\t\t(property \"Datasheet\" \"{STUB_MARKER}\" (at 0 0 0) hide)\n\t\t(property \"Description\" \"Library-owned placement defaults\" (at 0 0 0) hide)\n\t\t(symbol \"WITH_DEFAULTS_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n"
+            ),
+        )
+        .unwrap();
         // LM2904-style multi-unit part: unit 1 = pins 1-3, unit 2 = pins 5-7,
         // unit 3 = power pins 4/8 (#35 repro shape).
         let pin = |num: &str, x: f64, y: f64, angle: u32| {
@@ -4393,6 +4452,73 @@ mod tests {
                 .any(|line| line.ends_with(' ') || line.ends_with('\t')),
             "component placement must not leave trailing whitespace: {raw:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn placement_uses_library_value_and_footprint_unless_explicitly_overridden() {
+        let (dir, _env) = stub_symbol_dir();
+        let path = dir.path().join("defaults.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+
+        let inherited = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:WITH_DEFAULTS",
+                "x": 100.0, "y": 80.0,
+                "reference": "U1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let inherited: serde_json::Value =
+            serde_json::from_str(&content_text(&inherited)).expect("placement JSON");
+        assert_eq!(inherited["fields"]["Value"], "Library Default");
+        assert_eq!(
+            inherited["fields"]["Footprint"],
+            "Package_DIP:DIP-8_W7.62mm"
+        );
+
+        let overridden = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:WITH_DEFAULTS",
+                "x": 120.0, "y": 80.0,
+                "reference": "U2",
+                "value": "Explicit Value",
+                "footprint": "Package_DIP:DIP-14_W7.62mm"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let overridden: serde_json::Value =
+            serde_json::from_str(&content_text(&overridden)).expect("placement JSON");
+        assert_eq!(overridden["fields"]["Value"], "Explicit Value");
+        assert_eq!(
+            overridden["fields"]["Footprint"],
+            "Package_DIP:DIP-14_W7.62mm"
+        );
+    }
+
+    #[test]
+    fn placement_field_resolution_preserves_empty_library_footprints_and_old_value_fallback() {
+        let metadata = cse::library::SymbolMetadata::default();
+        let fields = PlacementFields::resolve("Device:R", &metadata, None, None);
+        assert_eq!(fields.value, "R");
+        assert_eq!(fields.footprint, "");
+
+        let fields = PlacementFields::resolve(
+            "Device:R",
+            &metadata,
+            Some("10k"),
+            Some("Resistor_THT:R_Axial"),
+        );
+        assert_eq!(fields.value, "10k");
+        assert_eq!(fields.footprint, "Resistor_THT:R_Axial");
     }
 
     #[tokio::test]
