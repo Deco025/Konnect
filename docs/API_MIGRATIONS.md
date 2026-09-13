@@ -3,6 +3,33 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: tool input schemas are enforced at dispatch (patch release)
+
+Konnect now compiles and caches every advertised Draft 2020-12 tool-input
+schema and validates calls before invoking either a domain handler or a
+meta-tool. A malformed present option no longer looks like omission and cannot
+silently select the option's default.
+
+Calls newly return a structured `invalid_argument` naming the failing field
+when they contain a wrong JSON type, a fractional value for an integer field,
+a declared out-of-range value, or an unknown property inside an object that
+explicitly declares `additionalProperties: false`. Nested fields use paths such
+as `components[0].unit` and `graphics[0].colour`. Objects without a closed
+schema remain open; this change does not invent new restrictions that the
+served schema does not declare.
+
+JSON numbers `2` and `2.0` both satisfy an integer schema; `2.7` does not.
+Omitted optional arguments and their existing defaults remain compatible.
+`add_schematic_component`, `batch_place_components`, and `replace_component`
+now declare `unit >= 1`. `add_hierarchical_sheet` and `edit_sheet` now declare
+and directly enforce `width > 0` and `height > 0`; refusals occur before a
+schematic write or child-file creation. Correct the named field and retry.
+
+Tool authors now get an immediate failure while constructing the catalogue if
+an advertised schema cannot compile. Catalogue conformance tests cover schema
+compilation, cached reuse, closed nested objects and unions, declared bounds,
+wrong-typed options, integer-number compatibility, and no-write-on-refusal.
+
 ## Unreleased: placement preserves library Value and Footprint (minor release)
 
 `add_schematic_component`, every entry of `batch_place_components`, and

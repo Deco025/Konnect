@@ -41,10 +41,16 @@ it with a misspelled or removed public API.
 
 ## Argument Contracts
 
-`mcp/handler.rs` enforces the schema's `required` list before invoking a domain
-handler. Presence is only the first gate: handlers must use the typed helpers in
-`tools/mod.rs` so a value of the wrong JSON type produces a structured
-`invalid_argument` response.
+`mcp/handler.rs` compiles and caches each advertised Draft 2020-12 schema and
+enforces it before invoking a domain handler or meta-tool. This covers required
+fields, present-value types, integer semantics, declared bounds, nested unions
+and arrays, and unknown keys only where an object declares
+`additionalProperties: false`. Failures return structured `invalid_argument`
+responses naming the nested field.
+
+Handlers must still use checked helpers from `tools/mod.rs`. Most unit tests and
+some internal paths call handlers directly, so dispatch validation is a shared
+boundary, not a substitute for domain validation.
 
 Use the appropriate helper, including:
 
@@ -52,6 +58,8 @@ Use the appropriate helper, including:
 - `require_f64`
 - `require_array`
 - `require_u64`
+- `opt_u32` for optional 32-bit integers (`2` and `2.0` accepted; fractions refused)
+- `opt_positive_f64` for optional positive dimensions
 - `get_path`
 
 Do not use an `unwrap_or` default for a schema-required argument. An explicit

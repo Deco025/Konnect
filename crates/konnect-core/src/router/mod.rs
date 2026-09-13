@@ -143,6 +143,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loaded_tools_reuse_their_compiled_input_schema() {
+        let router = ToolRouter::new();
+        router.load("project").await.expect("known toolset");
+
+        let first = router
+            .get_tool("create_project")
+            .await
+            .expect("loaded tool");
+        let second = router
+            .get_tool("create_project")
+            .await
+            .expect("loaded tool");
+        assert!(std::sync::Arc::ptr_eq(
+            &first.input_validator,
+            &second.input_validator
+        ));
+
+        let catalogue_first = registry::tools_for("project").expect("registered toolset");
+        let catalogue_second = registry::tools_for("project").expect("registered toolset");
+        assert!(std::sync::Arc::ptr_eq(
+            &catalogue_first[0].input_validator,
+            &catalogue_second[0].input_validator
+        ));
+    }
+
+    #[test]
+    fn every_registered_input_schema_is_valid_draft_2020_12() {
+        for toolset in registry::ALL_TOOLSETS {
+            for tool in registry::tools_for(toolset.name).expect("registered toolset") {
+                assert!(
+                    jsonschema::draft202012::meta::is_valid(&tool.input_schema),
+                    "{} has an invalid input schema",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn starter_kit_loads_expected_toolsets_and_nothing_more() {
         let router = ToolRouter::new();
         router.load_starter_kit().await;

@@ -62,6 +62,9 @@ pub struct ToolDef {
     pub name: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
+    /// Compiled once with the tool definition and reused for every dispatch.
+    /// The schema shown to clients is therefore the schema the server enforces.
+    pub input_validator: Arc<jsonschema::Validator>,
     pub handler: ToolHandlerFn,
     /// How the tool interacts with a board held by KiCad. Client guidance can
     /// derive warnings from this runtime contract instead of maintaining a
@@ -89,6 +92,23 @@ pub enum BoardAccess {
 }
 
 impl ToolDef {
+    pub fn new(
+        name: &'static str,
+        description: &'static str,
+        input_schema: Value,
+        handler: ToolHandlerFn,
+    ) -> Self {
+        let input_validator = compile_input_validator(name, &input_schema);
+        Self {
+            name,
+            description,
+            input_schema,
+            input_validator,
+            handler,
+            board_access: BoardAccess::None,
+        }
+    }
+
     pub fn with_board_access(mut self, board_access: BoardAccess) -> Self {
         self.board_access = board_access;
         self
@@ -308,14 +328,18 @@ macro_rules! tool {
             let ctx = ctx.clone();
             Box::pin(async move { ($handler)(&args, &*ctx).await })
         });
-        $crate::tools::ToolDef {
-            name: $name,
-            description: $desc,
-            input_schema: $schema,
-            handler: h,
-            board_access: $crate::tools::BoardAccess::None,
-        }
+        $crate::tools::ToolDef::new($name, $desc, $schema, h)
     }};
+}
+
+pub(crate) fn compile_input_validator(
+    name: &str,
+    input_schema: &Value,
+) -> Arc<jsonschema::Validator> {
+    Arc::new(
+        jsonschema::draft202012::new(input_schema)
+            .unwrap_or_else(|error| panic!("invalid input schema for tool '{name}': {error}")),
+    )
 }
 
 // ─── IPC helpers ──────────────────────────────────────────────────────────────
@@ -626,6 +650,40 @@ pub fn require_f64(args: &Value, key: &str) -> Result<f64, CallToolResult> {
 /// Extract an optional f64.
 pub fn opt_f64(args: &Value, key: &str) -> Option<f64> {
     args[key].as_f64()
+}
+
+/// Extract an optional positive f64. Unlike [`opt_f64`], a malformed present
+/// value is not treated as omission, and zero/negative values are refused.
+pub fn opt_positive_f64(args: &Value, key: &str) -> Result<Option<f64>, CallToolResult> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        value => match value.as_f64() {
+            Some(number) if number > 0.0 => Ok(Some(number)),
+            Some(_) => Err(invalid_arg(key, "must be greater than zero")),
+            None => Err(invalid_arg(key, "must be a number greater than zero")),
+        },
+    }
+}
+
+/// Extract an optional u32 while accepting either JSON spelling of an integer
+/// (`2` and `2.0`). Fractions, negative values, and overflow are refused
+/// instead of being silently narrowed by `as u32`. Domain-specific lower
+/// bounds remain with the caller so it can preserve a more useful diagnostic.
+pub fn opt_u32(args: &Value, key: &str) -> Result<Option<u32>, CallToolResult> {
+    let value = match &args[key] {
+        Value::Null => return Ok(None),
+        value => value,
+    };
+    let Some(number) = value.as_f64() else {
+        return Err(invalid_arg(key, "must be a non-negative integer"));
+    };
+    if number < 0.0 || number.fract() != 0.0 {
+        return Err(invalid_arg(key, "must be a non-negative integer"));
+    }
+    if number > f64::from(u32::MAX) {
+        return Err(invalid_arg(key, "is out of range for a 32-bit unit number"));
+    }
+    Ok(Some(number as u32))
 }
 
 /// Extract a required array argument. Returns a structured `InvalidArgument`

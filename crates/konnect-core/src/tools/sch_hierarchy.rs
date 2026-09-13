@@ -10,7 +10,8 @@
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{
-    get_path, opt_f64, opt_str, project_name_for, require_f64, require_str, ToolContext, ToolDef,
+    get_path, opt_f64, opt_positive_f64, opt_str, project_name_for, require_f64, require_str,
+    ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
@@ -40,8 +41,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "sheet_name": { "type": "string", "description": "Display name (Sheetname property). Default: 'Sheet'" },
                     "x": { "type": "number", "description": "Top-left X in mm. Default: 50" },
                     "y": { "type": "number", "description": "Top-left Y in mm. Default: 50" },
-                    "width": { "type": "number", "description": "Sheet box width in mm. Default: 80" },
-                    "height": { "type": "number", "description": "Sheet box height in mm. Default: 50" },
+                    "width": { "type": "number", "exclusiveMinimum": 0, "description": "Sheet box width in mm. Default: 80" },
+                    "height": { "type": "number", "exclusiveMinimum": 0, "description": "Sheet box height in mm. Default: 50" },
                     "project_name": { "type": "string", "description": "Project name key for the page-number instance entry. Default: the schematic file's stem (matching eeschema)" }
                 },
                 "required": ["schematic", "sheet_file"]
@@ -62,7 +63,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "new_name": { "type": "string" },
                     "new_file": { "type": "string" },
                     "x": { "type": "number" }, "y": { "type": "number" },
-                    "width": { "type": "number" }, "height": { "type": "number" },
+                    "width": { "type": "number", "exclusiveMinimum": 0 }, "height": { "type": "number", "exclusiveMinimum": 0 },
                     "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
                 },
                 "required": ["schematic", "sheet_name"]
@@ -630,8 +631,14 @@ async fn handle_add_hierarchical_sheet(
     let sheet_name = opt_str(args, "sheet_name").unwrap_or("Sheet").to_string();
     let x = opt_f64(args, "x").unwrap_or(50.0);
     let y = opt_f64(args, "y").unwrap_or(50.0);
-    let width = opt_f64(args, "width").unwrap_or(80.0);
-    let height = opt_f64(args, "height").unwrap_or(50.0);
+    let width = match opt_positive_f64(args, "width") {
+        Ok(width) => width.unwrap_or(80.0),
+        Err(error) => return Ok(error),
+    };
+    let height = match opt_positive_f64(args, "height") {
+        Ok(height) => height.unwrap_or(50.0),
+        Err(error) => return Ok(error),
+    };
     let project_name = opt_str(args, "project_name")
         .map(str::to_string)
         .unwrap_or_else(|| project_name_for(&parent_path));
@@ -765,6 +772,14 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     let project_name = opt_str(args, "project_name")
         .map(str::to_string)
         .unwrap_or_else(|| project_name_for(&sch_path));
+    let requested_width = match opt_positive_f64(args, "width") {
+        Ok(width) => width,
+        Err(error) => return Ok(error),
+    };
+    let requested_height = match opt_positive_f64(args, "height") {
+        Ok(height) => height,
+        Err(error) => return Ok(error),
+    };
 
     let before = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::load(&sch_path)?;
@@ -805,7 +820,7 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
             changed.push("position");
         }
     }
-    if let (Some(w), Some(h)) = (opt_f64(args, "width"), opt_f64(args, "height")) {
+    if let (Some(w), Some(h)) = (requested_width, requested_height) {
         requested.push("size");
         if sheet.width != w || sheet.height != h {
             sheet.set_size(w, h);
@@ -1747,6 +1762,50 @@ mod tests {
             before,
             "a no-op edit leaves the file alone"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_sheet_handlers_refuse_non_positive_sizes_without_writing() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let before = std::fs::read_to_string(&root).unwrap();
+
+        let edited = handle_edit_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_name": "Power",
+                "width": 80.0,
+                "height": -20.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(edited.is_error);
+        let body = result_json(&edited);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "height");
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), before);
+
+        let child = tmp.path().join("invalid-size.kicad_sch");
+        let added = handle_add_hierarchical_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "invalid-size.kicad_sch",
+                "width": 0.0,
+                "height": 50.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(added.is_error);
+        let body = result_json(&added);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "width");
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), before);
+        assert!(!child.exists());
     }
 
     #[tokio::test]

@@ -8,8 +8,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_str, require_array, require_f64, require_str,
-    ToolDef,
+    find_all_symbol_instance_blocks, get_path, opt_str, opt_u32, require_array, require_f64,
+    require_str, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -90,7 +90,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "reference": { "type": "string" },
                                 "value": { "type": "string" },
                                 "footprint": { "type": "string" },
-                                "unit": { "type": "integer", "default": 1 }
+                                "unit": { "type": "integer", "minimum": 1, "default": 1 }
                             },
                             "required": ["lib_id", "x", "y"]
                         }
@@ -533,7 +533,13 @@ async fn handle_batch_place_components(
         let reference = comp["reference"].as_str().unwrap_or("?");
         let value = comp["value"].as_str();
         let footprint = comp["footprint"].as_str();
-        let unit = comp["unit"].as_f64().unwrap_or(1.0) as u32;
+        let unit = match opt_u32(comp, "unit") {
+            Ok(unit) => unit.unwrap_or(1),
+            Err(error) => {
+                errors.push(error_text(&error));
+                continue;
+            }
+        };
 
         match place_one_component(
             &mut sch,

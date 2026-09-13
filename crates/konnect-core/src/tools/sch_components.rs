@@ -10,7 +10,7 @@ use crate::mcp::{
 };
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, reembed_lib_symbols,
+    find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, opt_u32, reembed_lib_symbols,
     require_array, require_f64, require_str, ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
@@ -104,7 +104,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "reference": { "type": "string", "description": "Optional override for reference designator" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
                     "footprint": { "type": "string", "description": "Optional override for the library symbol's Footprint" },
-                    "unit": { "type": "integer", "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 }
+                    "unit": { "type": "integer", "minimum": 1, "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 }
                 },
                 "required": ["schematic", "lib_id", "x", "y"]
             }),
@@ -342,7 +342,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "reference": { "type": "string", "description": "Component reference designator (e.g. 'U1')" },
                     "new_lib_id": { "type": "string", "description": "New Library:Symbol identifier (e.g. 'Device:C')" },
-                    "unit": { "type": "integer", "description": "Optional unit number for a single placed unit; rejected as ambiguous when the reference has multiple placements. When omitted, every existing unit number is preserved and validated against the new symbol." }
+                    "unit": { "type": "integer", "minimum": 1, "description": "Optional unit number for a single placed unit; rejected as ambiguous when the reference has multiple placements. When omitted, every existing unit number is preserved and validated against the new symbol." }
                 },
                 "required": ["schematic", "reference", "new_lib_id"]
             }),
@@ -565,7 +565,10 @@ async fn handle_add_schematic_component(
     let reference = opt_str(args, "reference");
     let value = opt_str(args, "value");
     let footprint = opt_str(args, "footprint");
-    let unit = opt_f64(args, "unit").unwrap_or(1.0) as u32;
+    let unit = match opt_u32(args, "unit") {
+        Ok(unit) => unit.unwrap_or(1),
+        Err(error) => return Ok(error),
+    };
     let ref_str = reference.unwrap_or("?");
 
     // Load via konnect-schematic-editor
@@ -2781,36 +2784,15 @@ async fn handle_edit_schematic_component(
     let mut applied_placements: Vec<(String, FieldPlacement)> = Vec::new();
     let mut placement_unit: Option<u32> = None;
     if let Some(placements) = placements {
-        let only_unit = match &args["unit"] {
-            serde_json::Value::Null => None,
-            value => {
-                let Some(unit) = value.as_u64() else {
-                    return Ok(crate::tools::invalid_arg(
-                        "unit",
-                        "expected a positive integer unit number",
-                    ));
-                };
-                // `as u32` truncates rather than refusing: 4294967297 becomes
-                // 1 and would silently edit a real unit's field text.
-                match u32::try_from(unit) {
-                    Ok(unit) if unit >= 1 => Some(unit),
-                    Ok(_) => {
-                        return Ok(crate::tools::invalid_arg(
-                            "unit",
-                            "expected a positive integer unit number",
-                        ))
-                    }
-                    Err(_) => {
-                        return Ok(crate::tools::invalid_arg(
-                            "unit",
-                            &format!(
-                                "unit {unit} is out of range; a placed unit number \
-                                 fits in 32 bits"
-                            ),
-                        ))
-                    }
-                }
+        let only_unit = match opt_u32(args, "unit") {
+            Ok(Some(0)) => {
+                return Ok(crate::tools::invalid_arg(
+                    "unit",
+                    "expected a positive integer unit number",
+                ))
             }
+            Ok(unit) => unit,
+            Err(error) => return Ok(error),
         };
         for (name, spec) in placements {
             let Some(spec) = spec.as_object() else {
@@ -3943,7 +3925,10 @@ async fn handle_replace_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let new_unit = opt_f64(args, "unit").map(|u| u as u32);
+    let new_unit = match opt_u32(args, "unit") {
+        Ok(unit) => unit,
+        Err(error) => return Ok(error),
+    };
 
     let mut content = read_consistent(&sch_path)?;
     let expected = content.clone();
@@ -4559,6 +4544,43 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains(&format!("/{}", root_uuid)));
         assert!(raw.contains("(unit 3)"), "instance unit must be 3");
+    }
+
+    #[tokio::test]
+    async fn direct_add_component_refuses_a_malformed_unit_without_writing() {
+        let (dir, _env) = stub_symbol_dir();
+        let path = dir.path().join("malformed-unit.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        for unit in [json!("two"), json!(2.7)] {
+            let result = handle_add_schematic_component(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": "Device:OPAMP_DUAL",
+                    "x": 100.0,
+                    "y": 80.0,
+                    "reference": "U1",
+                    "unit": unit
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument")
+            );
+            let body: serde_json::Value = serde_json::from_str(&content_text(&result)).unwrap();
+            assert_eq!(body["error"]["field"], "unit");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
     }
 
     fn content_text(res: &CallToolResult) -> String {

@@ -10,6 +10,7 @@ use crate::observability::{
 use crate::router::{meta_tools, ToolRouter};
 use axum::response::sse::Event;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
@@ -29,6 +30,9 @@ pub struct McpHandler {
     /// silently dropped on stdio — the cause of issue #19.
     notif_sinks: Arc<RwLock<Vec<mpsc::Sender<String>>>>,
     observer: CallObserver,
+    /// Meta-tools bypass the domain router, so their advertised schemas are
+    /// compiled here once and enforced at the same dispatch boundary.
+    meta_input_validators: Arc<HashMap<String, Arc<jsonschema::Validator>>>,
 }
 
 /// MCP clients known to cache the first `tools/list` and ignore
@@ -82,6 +86,14 @@ impl McpHandler {
         }
 
         let observer = CallObserver::new(Some(default_calls_log_path()));
+        let meta_input_validators = meta_tools::meta_tool_descriptions_for(cfg!(unix))
+            .into_iter()
+            .map(|tool| {
+                let validator =
+                    crate::tools::compile_input_validator(&tool.name, &tool.input_schema);
+                (tool.name, validator)
+            })
+            .collect();
         let ctx = Arc::new(
             crate::tools::ToolContext::new_with_observer(config, router, observer.clone())
                 .with_config_resolution(config_resolution),
@@ -93,6 +105,7 @@ impl McpHandler {
             sse_senders: Arc::new(RwLock::new(Vec::new())),
             notif_sinks: Arc::new(RwLock::new(Vec::new())),
             observer,
+            meta_input_validators: Arc::new(meta_input_validators),
         })
     }
 
@@ -297,6 +310,11 @@ impl McpHandler {
         args: &Value,
     ) -> (CallToolResult, CallStatus, Option<String>) {
         // Meta-tools always win.
+        if let Some(validator) = self.meta_input_validators.get(name) {
+            if let Err(error) = validator.validate(args) {
+                return schema_argument_error(&error);
+            }
+        }
         if let Some(result) =
             meta_tools::handle_meta_tool_with_reload(name, args, &self.ctx, &self.reload).await
         {
@@ -347,6 +365,9 @@ impl McpHandler {
                     CallStatus::Error,
                     Some("invalid_argument".to_string()),
                 );
+            }
+            if let Err(error) = tool_def.input_validator.validate(args) {
+                return schema_argument_error(&error);
             }
             return match (tool_def.handler)(args, self.ctx.clone()).await {
                 Ok(result) => {
@@ -940,6 +961,348 @@ mod every_tool_enforces_its_required_arguments {
             wrong.len(),
             wrong.join("\n  ")
         );
+    }
+}
+
+/// Turn a JSON Schema failure into Konnect's stable structured argument shape.
+/// Prefer a concrete nested leaf over an applicator (`oneOf`/`anyOf`) wrapper,
+/// and include an unexpected property's own name rather than only its parent.
+fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, String) {
+    use jsonschema::error::ValidationErrorKind;
+
+    fn specific<'a>(
+        error: &'a jsonschema::ValidationError<'a>,
+    ) -> &'a jsonschema::ValidationError<'a> {
+        let alternatives = match error.kind() {
+            ValidationErrorKind::OneOfNotValid { context }
+            | ValidationErrorKind::AnyOf { context } => Some(context),
+            _ => None,
+        };
+        let Some(alternatives) = alternatives else {
+            return error;
+        };
+
+        alternatives
+            .iter()
+            .min_by_key(|errors| errors.len())
+            .and_then(|errors| {
+                errors
+                    .iter()
+                    .find(|candidate| {
+                        matches!(
+                            candidate.kind(),
+                            ValidationErrorKind::AdditionalProperties { .. }
+                                | ValidationErrorKind::Required { .. }
+                                | ValidationErrorKind::Type { .. }
+                        )
+                    })
+                    .or_else(|| errors.first())
+            })
+            .map(specific)
+            .unwrap_or(error)
+    }
+
+    fn field_path(pointer: &str) -> String {
+        let mut field = String::new();
+        for raw in pointer.split('/').skip(1) {
+            let segment = raw.replace("~1", "/").replace("~0", "~");
+            if segment.chars().all(|ch| ch.is_ascii_digit()) {
+                field.push('[');
+                field.push_str(&segment);
+                field.push(']');
+            } else {
+                if !field.is_empty() {
+                    field.push('.');
+                }
+                field.push_str(&segment);
+            }
+        }
+        field
+    }
+
+    let error = specific(error);
+    let mut field = field_path(&error.instance_path().to_string());
+    match error.kind() {
+        ValidationErrorKind::AdditionalProperties { unexpected } => {
+            if let Some(property) = unexpected.first() {
+                if !field.is_empty() {
+                    field.push('.');
+                }
+                field.push_str(property);
+            }
+        }
+        ValidationErrorKind::Required { property } => {
+            if let Some(property) = property.as_str() {
+                if !field.is_empty() {
+                    field.push('.');
+                }
+                field.push_str(property);
+            }
+        }
+        _ => {}
+    }
+    if field.is_empty() {
+        field = "arguments".to_string();
+    }
+    (field, error.to_string())
+}
+
+fn schema_argument_error(
+    error: &jsonschema::ValidationError<'_>,
+) -> (CallToolResult, CallStatus, Option<String>) {
+    let (field, reason) = schema_validation_error(error);
+    (
+        CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: field.clone(),
+                reason: reason.clone(),
+            },
+            format!("Argument '{field}' is invalid: {reason}"),
+        ),
+        CallStatus::Error,
+        Some("invalid_argument".to_string()),
+    )
+}
+
+/// Schema-declared input rules are a server contract, not client guidance.
+/// These cases exercise the served dispatch so a malformed present value is
+/// refused before a handler can substitute a default or touch a design file.
+#[cfg(test)]
+mod schema_validation_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    fn error_json(result: &CallToolResult) -> Value {
+        let text = match result.content.first() {
+            Some(ToolContent::Text { text }) => text,
+            other => panic!("expected structured text error, got {other:?}"),
+        };
+        serde_json::from_str(text).unwrap_or_else(|error| panic!("{error}: {text}"))
+    }
+
+    async fn assert_invalid_field(handler: &McpHandler, tool: &str, args: Value, field: &str) {
+        let (result, status, kind) = handler.dispatch_tool(tool, &args).await;
+        assert!(result.is_error, "{tool}: malformed input must be refused");
+        assert_eq!(status, CallStatus::Error, "{tool}");
+        assert_eq!(kind.as_deref(), Some("invalid_argument"), "{tool}");
+        let body = error_json(&result);
+        assert_eq!(body["error"]["field"], field, "{tool}: {body}");
+    }
+
+    #[tokio::test]
+    async fn json_rpc_tools_call_returns_the_structured_schema_error() {
+        let handler = handler().await;
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 17,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_schematic_component",
+                    "arguments": {
+                        "schematic": "does-not-exist.kicad_sch",
+                        "lib_id": "Amplifier_Operational:LM2904",
+                        "x": 10.0,
+                        "y": 10.0,
+                        "unit": 2.7
+                    }
+                }
+            }))
+            .await
+            .expect("requests receive a JSON-RPC response");
+
+        assert!(response.error.is_none(), "tool errors are MCP results");
+        let result: CallToolResult =
+            serde_json::from_value(response.result.expect("tools/call returns a result"))
+                .expect("result uses the advertised MCP shape");
+        assert!(result.is_error);
+        let body = error_json(&result);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "unit");
+    }
+
+    #[tokio::test]
+    async fn wrong_typed_and_fractional_integer_options_are_refused_by_field() {
+        let handler = handler().await;
+        let schematic = "does-not-exist.kicad_sch";
+
+        for unit in [json!("two"), json!(2.7)] {
+            for (tool, args, field) in [
+                (
+                    "add_schematic_component",
+                    json!({
+                        "schematic": schematic,
+                        "lib_id": "Amplifier_Operational:LM2904",
+                        "x": 10.0,
+                        "y": 10.0,
+                        "unit": unit
+                    }),
+                    "unit",
+                ),
+                (
+                    "replace_component",
+                    json!({
+                        "schematic": schematic,
+                        "reference": "U1",
+                        "new_lib_id": "Amplifier_Operational:LM2904",
+                        "unit": unit
+                    }),
+                    "unit",
+                ),
+                (
+                    "batch_place_components",
+                    json!({
+                        "schematic": schematic,
+                        "components": [{
+                            "lib_id": "Amplifier_Operational:LM2904",
+                            "x": 10.0,
+                            "y": 10.0,
+                            "unit": unit
+                        }]
+                    }),
+                    "components[0].unit",
+                ),
+            ] {
+                assert_invalid_field(&handler, tool, args, field).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn integral_json_number_satisfies_an_integer_schema() {
+        let handler = handler().await;
+        let (result, _, kind) = handler
+            .dispatch_tool(
+                "add_schematic_component",
+                &json!({
+                    "schematic": "does-not-exist.kicad_sch",
+                    "lib_id": "Amplifier_Operational:LM2904",
+                    "x": 10.0,
+                    "y": 10.0,
+                    "unit": 2.0
+                }),
+            )
+            .await;
+
+        if kind.as_deref() == Some("invalid_argument") {
+            let body = error_json(&result);
+            assert_ne!(body["error"]["field"], "unit", "integral 2.0 is unit 2");
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_bounds_are_refused_before_a_handler_runs() {
+        let handler = handler().await;
+        assert_invalid_field(
+            &handler,
+            "add_zone",
+            json!({
+                "board": "does-not-exist.kicad_pcb",
+                "net_name": "GND",
+                "layer": "F.Cu",
+                "points": [
+                    {"x": 0.0, "y": 0.0},
+                    {"x": 10.0, "y": 0.0},
+                    {"x": 10.0, "y": 10.0}
+                ],
+                "priority": -5
+            }),
+            "priority",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn meta_tools_enforce_the_schema_they_advertise() {
+        let handler = handler().await;
+        assert_invalid_field(
+            &handler,
+            "get_recent_calls",
+            json!({"limit": "many"}),
+            "limit",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_nested_unknown_key_is_refused_without_changing_the_file() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let footprint = directory.path().join("socket.kicad_mod");
+        let source = include_str!("../../tests/fixtures/socket_kicad10.kicad_mod");
+        std::fs::write(&footprint, source).unwrap();
+
+        assert_invalid_field(
+            &handler,
+            "set_footprint_graphics",
+            json!({
+                "footprint_path": footprint.display().to_string(),
+                "selector": {"layer": "F.SilkS"},
+                "mode": "append",
+                "graphics": [{
+                    "type": "line",
+                    "start": {"x": 0.0, "y": 0.0},
+                    "end": {"x": 1.0, "y": 0.0},
+                    "stroke_width_mm": 0.2,
+                    "colour": "red"
+                }]
+            }),
+            "graphics[0].colour",
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read_to_string(&footprint).unwrap(),
+            source,
+            "dispatch refusal must happen before the footprint writer runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_keys_remain_allowed_where_the_schema_is_open() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("open-schema.kicad_mod");
+        let (result, _, kind) = handler
+            .dispatch_tool(
+                "create_footprint",
+                &json!({
+                    "output": output.display().to_string(),
+                    "name": "OpenSchema",
+                    "pads": [{
+                        "number": "1",
+                        "type": "smd",
+                        "shape": "rect",
+                        "x": 0.0,
+                        "y": 0.0,
+                        "width": 1.0,
+                        "height": 1.0,
+                        "rotaton": 90.0
+                    }]
+                }),
+            )
+            .await;
+
+        assert_ne!(kind.as_deref(), Some("invalid_argument"));
+        assert!(
+            !result.is_error,
+            "open schemas retain their declared behavior"
+        );
+        assert!(output.is_file());
     }
 }
 

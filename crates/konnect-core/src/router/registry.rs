@@ -5,6 +5,8 @@
 
 use super::ToolsetMeta;
 use crate::tools::ToolDef;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Toolsets auto-loaded when the server starts.
 ///
@@ -146,8 +148,28 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
 ];
 
-/// Return the ToolDefs for a given toolset name, or None if unknown.
+static TOOL_CATALOGUE: OnceLock<HashMap<&'static str, Vec<ToolDef>>> = OnceLock::new();
+
+fn tool_catalogue() -> &'static HashMap<&'static str, Vec<ToolDef>> {
+    TOOL_CATALOGUE.get_or_init(|| {
+        ALL_TOOLSETS
+            .iter()
+            .map(|toolset| {
+                let tools = build_tools_for(toolset.name)
+                    .unwrap_or_else(|| panic!("no tool builder for '{}'", toolset.name));
+                (toolset.name, tools)
+            })
+            .collect()
+    })
+}
+
+/// Return cached ToolDefs for a given toolset name, or None if unknown.
+/// Clones share each definition's compiled input validator through `Arc`.
 pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
+    tool_catalogue().get(name).cloned()
+}
+
+fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
     use crate::tools::*;
     match name {
         "project" => Some(project::tools()),
