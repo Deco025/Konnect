@@ -38,6 +38,12 @@ Only to answer questions not available through exports (sheet hierarchy, title b
 
 ## Standard Workflow
 
+Before a mutation, a dependent check, a retry, or a completion claim, read
+[the reliability contract](references/reliability-contract.md), starting with
+"For callers: establish what happened". Apply its outcome, source, coverage and
+recovery rules to the fields this installed server actually returns. Guidance
+does not establish that a missing server-side check ran.
+
 1. **Identify the project** — locate the `.kicad_pro` file
 2. **Classify the task** — read-only (Channel 2 or 3) or write (Channel 1)
 3. **Verify MCP is connected** — call `list_toolboxes` to confirm tools are available

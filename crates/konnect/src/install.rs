@@ -727,6 +727,31 @@ mod tests {
     }
 
     #[test]
+    fn claude_installs_the_canonical_reliability_contract_offline() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        let skill_dir = paths.skills_dir(InstallClient::Claude).join("konnect");
+        let installed = fs::read(skill_dir.join("references/reliability-contract.md")).unwrap();
+        assert_eq!(
+            installed,
+            include_bytes!("../../../docs/RELIABILITY_CONTRACT.md")
+        );
+        let skill = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(skill.contains("](references/reliability-contract.md)"));
+        for filename in [
+            "kicad-schematic-build-agent.md",
+            "kicad-design-review-agent.md",
+        ] {
+            let agent = fs::read_to_string(paths.claude_agents_dir().join(filename)).unwrap();
+            assert!(
+                agent.contains("references/reliability-contract.md"),
+                "{filename}"
+            );
+        }
+    }
+
+    #[test]
     fn hook_matchers_are_derived_from_registered_board_contracts() {
         let registered = konnect_core::router::registry::ALL_TOOLSETS
             .iter()

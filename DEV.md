@@ -11,6 +11,13 @@ Repository-wide naming, public API, branch, and pull-request rules live in
 
 ## Quick Start
 
+For tool implementation or review, read
+[the reliability contract](docs/RELIABILITY_CONTRACT.md) before choosing argument,
+mutation, result, or recovery handling. Reuse the existing structured errors,
+document-binding, transaction and readback helpers; document remaining gaps.
+The contract also describes the evidence required for a changed behavior and
+which catalogue-wide checks are still planned.
+
 ```bash
 # protoc is required for protobuf code generation. If PROTOC is unset, the
 # build falls back to `protoc` on PATH (see Build Requirements below).
