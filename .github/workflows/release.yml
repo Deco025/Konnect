@@ -17,6 +17,12 @@ env:
   KONNECT_BUILD_COMMIT: ${{ github.sha }}
 
 jobs:
+  real-kicad-acceptance:
+    name: Real KiCAD acceptance
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e-kicad.yml
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -236,7 +242,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build, pcm-package]
+    needs: [real-kicad-acceptance, build, pcm-package]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

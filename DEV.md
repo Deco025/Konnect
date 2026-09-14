@@ -174,10 +174,10 @@ Konnect/
     ├── e2e-kicad.yml                 # Real KiCAD 10.0.5: end-to-end suite, a
     │                                 # conformance pass over KiCAD's demo corpus, and
     │                                 # PCM assembly + schema validation. Weekly cron,
-    │                                 # manual dispatch, and `v*` tag push — not
-    │                                 # per-PR, and it does not gate release.yml
-    └── release.yml                   # 3 jobs: build (4 targets), pcm-package (3
-                                      # platforms, macOS universal via lipo), release
+    │                                 # manual dispatch, reusable release gate, and an
+    │                                 # opt-in label-triggered PR run.
+    └── release.yml                   # Real-KiCad gate, build (4 targets), PCM package
+                                      # (3 platforms, macOS universal via lipo), release
 ```
 
 ## KiCAD 10 Integration
