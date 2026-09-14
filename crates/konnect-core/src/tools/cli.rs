@@ -477,7 +477,12 @@ async fn publish_verified_files(
 pub(crate) mod test_support {
     use super::*;
 
-    fn write_script(dir: &Path, stem: &str, unix_body: &str, windows_body: &str) -> PathBuf {
+    pub(crate) fn write_script(
+        dir: &Path,
+        stem: &str,
+        unix_body: &str,
+        windows_body: &str,
+    ) -> PathBuf {
         #[cfg(windows)]
         let path = dir.join(format!("{stem}.cmd"));
         #[cfg(not(windows))]
@@ -524,26 +529,56 @@ pub(crate) mod test_support {
 /// Run ERC on a schematic and return parsed violations.
 /// KiCAD 10: `sch erc --output <path> --format json <input>`
 pub async fn run_erc(cli: &str, schematic: &Path) -> Result<Vec<ErcViolation>> {
-    let out_path = schematic.with_extension("erc.json");
-    let args = [
-        "sch",
-        "erc",
-        "--output",
-        out_path.to_str().unwrap(),
-        "--format",
-        "json",
-        schematic.to_str().unwrap(),
-    ];
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    run_erc_with_temp_root(cli, schematic, None).await
+}
 
-    let json_str = tokio::fs::read_to_string(&out_path)
-        .await
-        .context("ERC output file not found")?;
-    let raw: serde_json::Value = serde_json::from_str(&json_str)?;
+async fn run_erc_with_temp_root(
+    cli: &str,
+    schematic: &Path,
+    temp_root: Option<&Path>,
+) -> Result<Vec<ErcViolation>> {
+    let report_dir = match temp_root {
+        Some(root) => tempfile::Builder::new()
+            .prefix("konnect-erc-")
+            .tempdir_in(root),
+        None => tempfile::Builder::new().prefix("konnect-erc-").tempdir(),
+    }
+    .context("failed to create temporary ERC report directory")?;
+    let out_path = report_dir.path().join("report.json");
 
-    let violations = parse_erc_json(&raw);
-    let _ = tokio::fs::remove_file(&out_path).await;
-    Ok(violations)
+    let operation = async {
+        let args = [
+            "sch",
+            "erc",
+            "--output",
+            out_path
+                .to_str()
+                .context("temporary ERC path is not UTF-8")?,
+            "--format",
+            "json",
+            schematic.to_str().context("schematic path is not UTF-8")?,
+        ];
+        run_cli(cli, &args, LONG_TIMEOUT).await?;
+
+        let json_str = tokio::fs::read_to_string(&out_path)
+            .await
+            .context("ERC output file not found")?;
+        let raw: serde_json::Value = serde_json::from_str(&json_str)?;
+        Ok(parse_erc_json(&raw))
+    }
+    .await;
+
+    let cleanup = report_dir
+        .close()
+        .context("failed to clean up temporary ERC report directory");
+    match (operation, cleanup) {
+        (Ok(violations), Ok(())) => Ok(violations),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(operation_error), Err(cleanup_error)) => Err(operation_error.context(format!(
+            "also failed to clean up the temporary ERC report: {cleanup_error:#}"
+        ))),
+    }
 }
 
 fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
@@ -2080,6 +2115,40 @@ mod drc_parse_tests {
 mod erc_parse_tests {
     use super::*;
 
+    fn erc_cli(
+        dir: &Path,
+        stem: &str,
+        observed_path: &Path,
+        report: Option<&str>,
+        exit_code: i32,
+    ) -> PathBuf {
+        let observed = observed_path.display();
+        let unix_report = report
+            .map(|contents| format!("printf '%s' '{contents}' > \"$4\"\n"))
+            .unwrap_or_default();
+        let windows_report = report
+            .map(|contents| format!("> \"%~4\" echo {contents}\r\n"))
+            .unwrap_or_default();
+        test_support::write_script(
+            dir,
+            stem,
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$4\" > \"{observed}\"\n{unix_report}exit {exit_code}\n"
+            ),
+            &format!(
+                "@echo off\r\n> \"{observed}\" echo %~4\r\n{windows_report}exit /b {exit_code}\r\n"
+            ),
+        )
+    }
+
+    fn assert_empty(directory: &Path) {
+        assert_eq!(
+            std::fs::read_dir(directory).unwrap().count(),
+            0,
+            "temporary ERC directory should contain no artifacts"
+        );
+    }
+
     /// Shape produced by `kicad-cli sch erc --format json` (KiCAD 10.0.3,
     /// schema https://schemas.kicad.org/erc.v1.json), trimmed to the fields
     /// the parser touches. Captured from a real run on a 2-resistor divider.
@@ -2138,6 +2207,131 @@ mod erc_parse_tests {
                 }
             ]
         })
+    }
+
+    #[tokio::test]
+    async fn erc_report_never_touches_the_project_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let schematic = project.path().join("clock.kicad_sch");
+        let legacy_report = schematic.with_extension("erc.json");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+        std::fs::write(&legacy_report, b"user-owned report").unwrap();
+
+        let observed = control.path().join("observed.txt");
+        let cli = erc_cli(
+            control.path(),
+            "erc-success",
+            &observed,
+            Some(r#"{"sheets":[]}"#),
+            0,
+        );
+
+        #[cfg(unix)]
+        let original_permissions = {
+            use std::os::unix::fs::PermissionsExt;
+            let original = std::fs::metadata(project.path()).unwrap().permissions();
+            let mut read_only = original.clone();
+            read_only.set_mode(0o555);
+            std::fs::set_permissions(project.path(), read_only).unwrap();
+            original
+        };
+
+        let result =
+            run_erc_with_temp_root(cli.to_str().unwrap(), &schematic, Some(scratch.path())).await;
+
+        #[cfg(unix)]
+        std::fs::set_permissions(project.path(), original_permissions).unwrap();
+
+        assert!(result.unwrap().is_empty());
+        assert_eq!(std::fs::read(&legacy_report).unwrap(), b"user-owned report");
+        let report_path = PathBuf::from(std::fs::read_to_string(observed).unwrap().trim());
+        assert!(report_path.starts_with(scratch.path()));
+        assert_ne!(report_path.parent(), Some(project.path()));
+        assert!(!report_path.exists(), "temporary report should be removed");
+        assert_empty(scratch.path());
+    }
+
+    #[tokio::test]
+    async fn concurrent_erc_runs_use_distinct_report_paths() {
+        let project = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let schematic = project.path().join("clock.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+
+        let observed_a = control.path().join("observed-a.txt");
+        let observed_b = control.path().join("observed-b.txt");
+        let cli_a = erc_cli(
+            control.path(),
+            "erc-a",
+            &observed_a,
+            Some(r#"{"sheets":[]}"#),
+            0,
+        );
+        let cli_b = erc_cli(
+            control.path(),
+            "erc-b",
+            &observed_b,
+            Some(r#"{"sheets":[]}"#),
+            0,
+        );
+
+        let (result_a, result_b) = tokio::join!(
+            run_erc_with_temp_root(cli_a.to_str().unwrap(), &schematic, Some(scratch.path())),
+            run_erc_with_temp_root(cli_b.to_str().unwrap(), &schematic, Some(scratch.path()))
+        );
+        result_a.unwrap();
+        result_b.unwrap();
+
+        let path_a = PathBuf::from(std::fs::read_to_string(observed_a).unwrap().trim());
+        let path_b = PathBuf::from(std::fs::read_to_string(observed_b).unwrap().trim());
+        assert_ne!(path_a, path_b);
+        assert!(path_a.starts_with(scratch.path()));
+        assert!(path_b.starts_with(scratch.path()));
+        assert_empty(scratch.path());
+    }
+
+    #[tokio::test]
+    async fn temporary_report_is_cleaned_after_cli_and_parse_failures() {
+        let project = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let schematic = project.path().join("clock.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+
+        let failed_cli = erc_cli(
+            control.path(),
+            "erc-fails",
+            &control.path().join("failed-path.txt"),
+            None,
+            7,
+        );
+        run_erc_with_temp_root(
+            failed_cli.to_str().unwrap(),
+            &schematic,
+            Some(scratch.path()),
+        )
+        .await
+        .expect_err("CLI failure must be returned");
+        assert_empty(scratch.path());
+
+        let malformed_cli = erc_cli(
+            control.path(),
+            "erc-malformed",
+            &control.path().join("malformed-path.txt"),
+            Some("not-json"),
+            0,
+        );
+        run_erc_with_temp_root(
+            malformed_cli.to_str().unwrap(),
+            &schematic,
+            Some(scratch.path()),
+        )
+        .await
+        .expect_err("malformed report must be returned");
+        assert_empty(scratch.path());
     }
 
     #[test]
