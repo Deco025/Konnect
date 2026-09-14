@@ -3275,4 +3275,370 @@ mod tests {
             "the footprint the schematic never named is preserved untouched"
         );
     }
+
+    /// A complete #474 sync through the registered tool, not just the pure
+    /// planner. The mock speaks KiCad's real protobuf protocol and retains the
+    /// live board between requests, so the assertions below are an independent
+    /// readback of what the apply actually left behind.
+    #[tokio::test]
+    async fn issue_474_apply_preserves_every_board_only_object() {
+        use crate::router::ToolRouter;
+        use crate::tools::cli::test_support::write_script;
+        use crate::tools::{ServerConfig, ToolContext};
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct MockBoard {
+            footprints: Arc<Mutex<Vec<prost_types::Any>>>,
+            zones: Arc<Mutex<Vec<prost_types::Any>>>,
+        }
+
+        fn ok_item_status() -> kiapi::common::commands::ItemStatus {
+            kiapi::common::commands::ItemStatus {
+                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                error_message: String::new(),
+            }
+        }
+
+        fn two_pad_resistor(value: &str) -> prost_types::Any {
+            let pads = ["1", "2"].map(|number| konnect_ipc::IpcPadDefinition {
+                number: number.to_string(),
+                pad_type: "smd".to_string(),
+                shape: "rect".to_string(),
+                x: if number == "1" { -0.8 } else { 0.8 },
+                y: 0.0,
+                rotation: 0.0,
+                size_x: 0.9,
+                size_y: 1.0,
+                drill_x: None,
+                drill_y: None,
+                drill_oval: false,
+                layers: vec![
+                    "F.Cu".to_string(),
+                    "F.Paste".to_string(),
+                    "F.Mask".to_string(),
+                ],
+                roundrect_ratio: 0.0,
+            });
+            let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
+                "Resistor_SMD:R_0603_1608Metric",
+                "R1",
+                value,
+                &pads,
+                &[],
+                &konnect_ipc::IpcFieldPlacement::default(),
+                25.0,
+                30.0,
+                90.0,
+                "F.Cu",
+            )
+            .expect("valid resistor fixture");
+            let mut footprint =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                    .expect("fixture decodes");
+            footprint.id = Some(kiapi::common::types::Kiid {
+                value: "r1-live".to_string(),
+            });
+            footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+                path: vec![
+                    kiapi::common::types::Kiid {
+                        value: "sheet-uuid".to_string(),
+                    },
+                    kiapi::common::types::Kiid {
+                        value: "symbol-uuid".to_string(),
+                    },
+                ],
+                path_human_readable: "/Power/".to_string(),
+            });
+            let definition = footprint.definition.as_mut().expect("definition");
+            for child in &mut definition.items {
+                if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+                    continue;
+                }
+                let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+                    .expect("pad fixture decodes");
+                let (name, code) = if pad.number == "1" {
+                    ("/Power/VCC", 1)
+                } else {
+                    ("GND", 2)
+                };
+                pad.net = Some(kiapi::board::types::Net {
+                    code: Some(kiapi::board::types::NetCode { value: code }),
+                    name: name.to_string(),
+                });
+                *child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+            konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+        }
+
+        fn board_zone(id: &str, name: &str, rule_area: bool) -> prost_types::Any {
+            use kiapi::board::types::{ZoneConnectionStyle, ZoneType};
+            let points = [(10.0, 10.0), (40.0, 10.0), (40.0, 35.0), (10.0, 35.0)];
+            let mut zone = konnect_ipc::builders::build_zone(
+                &konnect_ipc::builders::ZoneSpec {
+                    layer: "F.Cu",
+                    net_name: "GND",
+                    points: &points,
+                    clearance_mm: 0.2,
+                    min_thickness_mm: 0.25,
+                    name,
+                    priority: 1,
+                    connection: ZoneConnectionStyle::ZcsThermal,
+                },
+                2,
+            );
+            zone.id = Some(kiapi::common::types::Kiid {
+                value: id.to_string(),
+            });
+            if rule_area {
+                zone.r#type = ZoneType::ZtRuleArea as i32;
+                zone.name = name.to_string();
+                zone.settings = Some(kiapi::board::types::zone::Settings::RuleAreaSettings(
+                    kiapi::board::types::RuleAreaSettings {
+                        keepout_copper: true,
+                        keepout_vias: true,
+                        keepout_tracks: true,
+                        keepout_pads: false,
+                        keepout_footprints: true,
+                        placement_enabled: false,
+                        placement_source_type: 0,
+                        placement_source: String::new(),
+                    },
+                ));
+            }
+            konnect_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone")
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let schematic = directory.path().join("preserve.kicad_sch");
+        let board = directory.path().join("preserve.kicad_pcb");
+        let exported = directory.path().join("preserve.net");
+        std::fs::write(
+            &schematic,
+            "(kicad_sch (version 20231120) (generator eeschema))\n",
+        )
+        .unwrap();
+        std::fs::write(&board, "(kicad_pcb (version 20240108))\n").unwrap();
+        std::fs::write(&exported, ONE_RESISTOR).unwrap();
+
+        let unix_source = exported.to_string_lossy().replace('\'', "'\\''");
+        let windows_source = exported.to_string_lossy();
+        let cli = write_script(
+            directory.path(),
+            "fake-kicad-cli-sync",
+            &format!(
+                "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    shift\n    cp '{unix_source}' \"$1\"\n    exit $?\n  fi\n  shift\ndone\nexit 2\n"
+            ),
+            &format!(
+                "@echo off\r\n:loop\r\nif \"%~1\"==\"\" exit /b 2\r\nif \"%~1\"==\"--output\" goto found\r\nshift\r\ngoto loop\r\n:found\r\nshift\r\ncopy /Y \"{windows_source}\" \"%~1\" >nul\r\nexit /b %ERRORLEVEL%\r\n"
+            ),
+        );
+
+        let schematic_backed = two_pad_resistor("1k");
+        let logo = konnect_ipc::builders::pack_any(
+            &board_only_instance("logo-live", "REF**"),
+            "kiapi.board.types.FootprintInstance",
+        );
+        let fiducial = konnect_ipc::builders::pack_any(
+            &board_only_instance("fiducial-live", "REF**"),
+            "kiapi.board.types.FootprintInstance",
+        );
+        let copper_zone = board_zone("zone-ground", "GND plane", false);
+        let keepout = board_zone("zone-keepout", "antenna keepout", true);
+        let state = MockBoard {
+            footprints: Arc::new(Mutex::new(vec![schematic_backed, logo, fiducial])),
+            zones: Arc::new(Mutex::new(vec![copper_zone, keepout])),
+        };
+        let footprints_before = state.footprints.lock().unwrap().clone();
+        let zones_before = state.zones.lock().unwrap().clone();
+        let responder_state = state.clone();
+
+        let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(
+            &board,
+            move |command| {
+                if command.type_url.ends_with("GetItems") {
+                    let request =
+                        kiapi::common::commands::GetItems::decode(command.value.as_slice())
+                            .expect("GetItems request");
+                    let requested = request.types.first().copied().unwrap_or_default();
+                    let items = match kiapi::common::types::KiCadObjectType::try_from(requested) {
+                        Ok(kiapi::common::types::KiCadObjectType::KotPcbFootprint) => {
+                            responder_state.footprints.lock().unwrap().clone()
+                        }
+                        Ok(kiapi::common::types::KiCadObjectType::KotPcbZone) => {
+                            responder_state.zones.lock().unwrap().clone()
+                        }
+                        _ => Vec::new(),
+                    };
+                    return Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items,
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ));
+                }
+                if command.type_url.ends_with("GetNets") {
+                    return Some(konnect_ipc::builders::pack_any(
+                        &kiapi::board::commands::NetsResponse {
+                            nets: vec![
+                                kiapi::board::types::Net {
+                                    code: Some(kiapi::board::types::NetCode { value: 1 }),
+                                    name: "/Power/VCC".to_string(),
+                                },
+                                kiapi::board::types::Net {
+                                    code: Some(kiapi::board::types::NetCode { value: 2 }),
+                                    name: "GND".to_string(),
+                                },
+                            ],
+                        },
+                        "kiapi.board.commands.NetsResponse",
+                    ));
+                }
+                if command.type_url.ends_with("GetBoundingBox") {
+                    return Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetBoundingBoxResponse {
+                            items: Vec::new(),
+                            boxes: vec![kiapi::common::types::Box2 {
+                                position: Some(konnect_ipc::builders::vec2(0.0, 0.0)),
+                                size: Some(konnect_ipc::builders::vec2(50.0, 40.0)),
+                            }],
+                        },
+                        "kiapi.common.commands.GetBoundingBoxResponse",
+                    ));
+                }
+                if command.type_url.ends_with("BeginCommit") {
+                    return Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::BeginCommitResponse {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "commit-474".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    ));
+                }
+                if command.type_url.ends_with("UpdateItems") {
+                    let request =
+                        kiapi::common::commands::UpdateItems::decode(command.value.as_slice())
+                            .expect("UpdateItems request");
+                    let mut board_footprints = responder_state.footprints.lock().unwrap();
+                    let mut updated_items = Vec::new();
+                    for updated in request.items {
+                        let updated_fp = kiapi::board::types::FootprintInstance::decode(
+                            updated.value.as_slice(),
+                        )
+                        .expect("updated footprint");
+                        let updated_id =
+                            updated_fp.id.as_ref().expect("updated KIID").value.clone();
+                        let position = board_footprints
+                            .iter()
+                            .position(|item| {
+                                kiapi::board::types::FootprintInstance::decode(
+                                    item.value.as_slice(),
+                                )
+                                .ok()
+                                .and_then(|fp| fp.id)
+                                .is_some_and(|id| id.value == updated_id)
+                            })
+                            .expect("existing update target");
+                        board_footprints[position] = updated.clone();
+                        updated_items.push(kiapi::common::commands::ItemUpdateResult {
+                            status: Some(ok_item_status()),
+                            item: Some(updated),
+                        });
+                    }
+                    return Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::UpdateItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            updated_items,
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    ));
+                }
+                if command.type_url.ends_with("EndCommit") {
+                    return Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ));
+                }
+                None
+            },
+        );
+
+        let router = Arc::new(ToolRouter::new());
+        router.load("sch_export").await.expect("registered toolset");
+        let tool = router
+            .get_tool("update_pcb_from_schematic")
+            .await
+            .expect("registered sync tool");
+        let context = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: cli.to_string_lossy().to_string(),
+                kicad_binary: String::new(),
+                ipc_address: server.address().to_string(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            router,
+        ));
+        let paths = serde_json::json!({
+            "schematic": schematic.to_string_lossy(),
+            "board": board.to_string_lossy(),
+        });
+        let dry_run = (tool.handler)(&paths, context.clone()).await.unwrap();
+        let dry_run: serde_json::Value = serde_json::from_str(&match &dry_run.content[0] {
+            ToolContent::Text { text } => text.clone(),
+            _ => panic!("sync response was not JSON text"),
+        })
+        .unwrap();
+        assert_eq!(dry_run["status"], "ready");
+        let apply = serde_json::json!({
+            "schematic": schematic.to_string_lossy(),
+            "board": board.to_string_lossy(),
+            "dry_run": false,
+            "expected_plan_revision": dry_run["plan_revision"],
+        });
+        let applied = (tool.handler)(&apply, context).await.unwrap();
+        let applied: serde_json::Value = serde_json::from_str(&match &applied.content[0] {
+            ToolContent::Text { text } => text.clone(),
+            _ => panic!("sync response was not JSON text"),
+        })
+        .unwrap();
+        assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["coverage"]["conflicts"]["applied"], 0);
+        assert_eq!(applied["coverage"]["board_only_preserved"]["applied"], 2);
+
+        let readback = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+        let document = readback
+            .find_open_board(&board)
+            .expect("the mock still holds the requested board");
+        let footprints_after = readback
+            .get_items_in(
+                document.clone(),
+                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+            )
+            .expect("footprint readback");
+        let zones_after = readback
+            .get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbZone)
+            .expect("zone and rule-area readback");
+        assert_ne!(
+            footprints_before[0].value, footprints_after[0].value,
+            "the schematic-backed resistor must really be updated"
+        );
+        assert_eq!(
+            &footprints_after[1..],
+            &footprints_before[1..],
+            "both board-only footprints must retain their complete protobuf identity and geometry"
+        );
+        assert_eq!(
+            zones_after, zones_before,
+            "the copper zone and keep-out/rule area must retain their complete protobuf identity and geometry"
+        );
+    }
 }
