@@ -3302,45 +3302,10 @@ mod tests {
             }
         }
 
-        fn two_pad_resistor(value: &str) -> prost_types::Any {
-            let pads = ["1", "2"].map(|number| konnect_ipc::IpcPadDefinition {
-                number: number.to_string(),
-                pad_type: "smd".to_string(),
-                shape: "rect".to_string(),
-                x: if number == "1" { -0.8 } else { 0.8 },
-                y: 0.0,
-                rotation: 0.0,
-                size_x: 0.9,
-                size_y: 1.0,
-                drill_x: None,
-                drill_y: None,
-                drill_oval: false,
-                layers: vec![
-                    "F.Cu".to_string(),
-                    "F.Paste".to_string(),
-                    "F.Mask".to_string(),
-                ],
-                roundrect_ratio: 0.0,
-            });
-            let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
-                "Resistor_SMD:R_0603_1608Metric",
-                "R1",
-                value,
-                &pads,
-                &[],
-                &konnect_ipc::IpcFieldPlacement::default(),
-                25.0,
-                30.0,
-                90.0,
-                "F.Cu",
-            )
-            .expect("valid resistor fixture");
-            let mut footprint =
-                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-                    .expect("fixture decodes");
-            footprint.id = Some(kiapi::common::types::Kiid {
-                value: "r1-live".to_string(),
-            });
+        fn schematic_backed_resistor() -> prost_types::Any {
+            const CAPTURE: &[u8] = include_bytes!("../../tests/fixtures/issue_474_r1.ipc.bin");
+            let mut footprint = kiapi::board::types::FootprintInstance::decode(CAPTURE)
+                .expect("the checked-in KiCad IPC capture must decode");
             footprint.symbol_path = Some(kiapi::common::types::SheetPath {
                 path: vec![
                     kiapi::common::types::Kiid {
@@ -3352,63 +3317,8 @@ mod tests {
                 ],
                 path_human_readable: "/Power/".to_string(),
             });
-            let definition = footprint.definition.as_mut().expect("definition");
-            for child in &mut definition.items {
-                if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
-                    continue;
-                }
-                let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice())
-                    .expect("pad fixture decodes");
-                let (name, code) = if pad.number == "1" {
-                    ("/Power/VCC", 1)
-                } else {
-                    ("GND", 2)
-                };
-                pad.net = Some(kiapi::board::types::Net {
-                    code: Some(kiapi::board::types::NetCode { value: code }),
-                    name: name.to_string(),
-                });
-                *child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
-            }
+            set_field_text(&mut footprint.value_field, "Value", "1k");
             konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
-        }
-
-        fn board_zone(id: &str, name: &str, rule_area: bool) -> prost_types::Any {
-            use kiapi::board::types::{ZoneConnectionStyle, ZoneType};
-            let points = [(10.0, 10.0), (40.0, 10.0), (40.0, 35.0), (10.0, 35.0)];
-            let mut zone = konnect_ipc::builders::build_zone(
-                &konnect_ipc::builders::ZoneSpec {
-                    layer: "F.Cu",
-                    net_name: "GND",
-                    points: &points,
-                    clearance_mm: 0.2,
-                    min_thickness_mm: 0.25,
-                    name,
-                    priority: 1,
-                    connection: ZoneConnectionStyle::ZcsThermal,
-                },
-                2,
-            );
-            zone.id = Some(kiapi::common::types::Kiid {
-                value: id.to_string(),
-            });
-            if rule_area {
-                zone.r#type = ZoneType::ZtRuleArea as i32;
-                zone.name = name.to_string();
-                zone.settings = Some(kiapi::board::types::zone::Settings::RuleAreaSettings(
-                    kiapi::board::types::RuleAreaSettings {
-                        keepout_copper: true,
-                        keepout_vias: true,
-                        keepout_tracks: true,
-                        keepout_pads: false,
-                        keepout_footprints: true,
-                        placement_enabled: false,
-                        placement_source_type: 0,
-                        placement_source: String::new(),
-                    },
-                ));
-            }
-            konnect_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone")
         }
 
         let directory = tempfile::tempdir().unwrap();
@@ -3417,11 +3327,21 @@ mod tests {
         let exported = directory.path().join("preserve.net");
         std::fs::write(
             &schematic,
-            "(kicad_sch (version 20231120) (generator eeschema))\n",
+            include_bytes!("../../tests/fixtures/structural_scans_kicad10.kicad_sch"),
         )
         .unwrap();
-        std::fs::write(&board, "(kicad_pcb (version 20240108))\n").unwrap();
-        std::fs::write(&exported, ONE_RESISTOR).unwrap();
+        std::fs::write(
+            &board,
+            include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb"),
+        )
+        .unwrap();
+        std::fs::write(
+            &exported,
+            ONE_RESISTOR
+                .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
+                .replace("/Power/VCC", "VCC"),
+        )
+        .unwrap();
 
         let unix_source = exported.to_string_lossy().replace('\'', "'\\''");
         let windows_source = exported.to_string_lossy();
@@ -3436,7 +3356,7 @@ mod tests {
             ),
         );
 
-        let schematic_backed = two_pad_resistor("1k");
+        let schematic_backed = schematic_backed_resistor();
         let logo = konnect_ipc::builders::pack_any(
             &board_only_instance("logo-live", "REF**"),
             "kiapi.board.types.FootprintInstance",
@@ -3445,8 +3365,26 @@ mod tests {
             &board_only_instance("fiducial-live", "REF**"),
             "kiapi.board.types.FootprintInstance",
         );
-        let copper_zone = board_zone("zone-ground", "GND plane", false);
-        let keepout = board_zone("zone-keepout", "antenna keepout", true);
+        let copper_zone = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Zone".to_string(),
+            value: include_bytes!("../../tests/fixtures/issue_474_copper_zone_0.ipc.bin").to_vec(),
+        };
+        let keepout = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Zone".to_string(),
+            value: include_bytes!("../../tests/fixtures/issue_474_zone_0.ipc.bin").to_vec(),
+        };
+        let copper_kind = kiapi::board::types::Zone::decode(copper_zone.value.as_slice())
+            .expect("captured copper zone");
+        let keepout_kind = kiapi::board::types::Zone::decode(keepout.value.as_slice())
+            .expect("captured rule area");
+        assert_eq!(
+            copper_kind.r#type,
+            kiapi::board::types::ZoneType::ZtCopper as i32
+        );
+        assert_eq!(
+            keepout_kind.r#type,
+            kiapi::board::types::ZoneType::ZtRuleArea as i32
+        );
         let state = MockBoard {
             footprints: Arc::new(Mutex::new(vec![schematic_backed, logo, fiducial])),
             zones: Arc::new(Mutex::new(vec![copper_zone, keepout])),
@@ -3597,7 +3535,7 @@ mod tests {
             _ => panic!("sync response was not JSON text"),
         })
         .unwrap();
-        assert_eq!(dry_run["status"], "ready");
+        assert_eq!(dry_run["status"], "ready", "{dry_run:#}");
         let apply = serde_json::json!({
             "schematic": schematic.to_string_lossy(),
             "board": board.to_string_lossy(),
@@ -3611,6 +3549,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["coverage"]["conflicts"]["planned"], 0);
         assert_eq!(applied["coverage"]["conflicts"]["applied"], 0);
         assert_eq!(applied["coverage"]["board_only_preserved"]["applied"], 2);
 
@@ -3627,9 +3566,24 @@ mod tests {
         let zones_after = readback
             .get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbZone)
             .expect("zone and rule-area readback");
-        assert_ne!(
-            footprints_before[0].value, footprints_after[0].value,
-            "the schematic-backed resistor must really be updated"
+        let before =
+            kiapi::board::types::FootprintInstance::decode(footprints_before[0].value.as_slice())
+                .expect("captured R1 before apply");
+        let after =
+            kiapi::board::types::FootprintInstance::decode(footprints_after[0].value.as_slice())
+                .expect("captured R1 after apply");
+        let before = board_footprint_from_instance(&before).expect("R1 identity before apply");
+        let after = board_footprint_from_instance(&after).expect("R1 identity after apply");
+        assert_eq!(before.value, "1k");
+        assert_eq!(after.value, "10k");
+        assert_eq!(after.footprint_id, before.footprint_id);
+        assert_eq!(
+            after.kiid, before.kiid,
+            "the updated footprint keeps its KIID"
+        );
+        assert_eq!(
+            after.position, before.position,
+            "the updated footprint keeps its placement"
         );
         assert_eq!(
             &footprints_after[1..],
