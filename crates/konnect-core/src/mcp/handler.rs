@@ -1070,6 +1070,59 @@ mod annotate_dispatch_tests {
     }
 }
 
+#[cfg(test)]
+mod ipc_failure_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// `ipc_failure` is a public response field (#532), so it has to survive
+    /// the served `tools/call` boundary, not only the handler functions the
+    /// tool tests call directly. The endpoint is a socket nothing listens on.
+    #[tokio::test]
+    async fn ipc_failure_kind_and_message_survive_the_served_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: format!("ipc://{}", dir.path().join("no-kicad-here.sock").display()),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        for (tool, arguments) in [
+            ("check_kicad_ui", json!({"timeout_seconds": 60})),
+            ("open_project", json!({})),
+        ] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments}
+                }))
+                .await
+                .expect("request returns a response");
+            let result = response.result.expect("successful JSON-RPC response");
+            assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+            let text = result["content"][0]["text"]
+                .as_str()
+                .expect("tool returns JSON text");
+            let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+            assert_eq!(body["ipc_failure"]["kind"], "no_listener", "{tool}: {body}");
+            assert!(
+                body["ipc_failure"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Nothing is listening there")),
+                "{tool}: {body}"
+            );
+        }
+    }
+}
+
 /// Turn a JSON Schema failure into Konnect's stable structured argument shape.
 /// Prefer a concrete nested leaf over an applicator (`oneOf`/`anyOf`) wrapper,
 /// and include an unexpected property's own name rather than only its parent.

@@ -246,6 +246,48 @@ Both additions are additive; `status`, `changes`, `diagnostics` and every
 existing count keep their names and meanings. No argument was renamed or
 removed.
 
+## Unreleased: IPC health responses say why KiCad did not answer (minor release)
+
+`check_kicad_ui` and `open_project` gain an `ipc_failure` field (#532). It is
+`{ "kind", "message" }` when a failure kind was established, where `kind` is
+one of `not_configured`, `no_listener`, `access_denied`, `handshake_failed`,
+`transport_error`, or `request_failed`. `request_failed` means the request
+did not complete and may have reached the endpoint: an explicit KiCad error
+status in `message` proves receipt, a receive timeout or malformed reply does
+not. `access_denied` means the operating system refused this account; it does
+not prove who owns the endpoint. Before this, every one of those
+surfaced only as `ipc_responsive: false` or `ipc_available: false`, so a KiCad
+that was listening but refused this account looked exactly like one that was
+closed.
+
+`ipc_failure: null` means **no failure kind was established**. That happens in
+two cases: the Ping succeeded with `AS_OK`, or `check_kicad_ui`'s own
+`timeout_seconds` deadline expired before the Ping finished. The second case
+still reports `timed_out: true`. A listener that accepts but never negotiates
+takes NNG's 10-second limit to report `handshake_failed`, longer than the
+default `timeout_seconds` of 5.
+
+No existing field was removed or renamed. Two existing values change wording:
+
+- `open_project`'s `message` for a KiCad that did not answer now depends on the
+  kind. Before, every unanswered call returned "KiCad IPC is not reachable.
+  Start KiCad and enable the IPC API, or work in file-only mode." That message
+  is kept for `not_configured`, `no_listener`, and `transport_error`. The other
+  three kinds return:
+  - `access_denied`: "The KiCad IPC endpoint refused this account, likely a
+    different account or a restrictive ACL; run Konnect as the same
+    operating-system user as KiCad. See ipc_failure."
+  - `handshake_failed`: "A listener at the KiCad IPC address did not complete
+    NNG's handshake, so it is probably not KiCad; see ipc_failure."
+  - `request_failed`: "The KiCad IPC request did not complete and may have
+    reached the endpoint; a KiCad status in ipc_failure proves receipt, and
+    KiCad may still be starting."
+- An IPC tool whose dial fails now says in its error text why the dial failed
+  ("Nothing is listening there…", "…it refused this account…", "…did not
+  complete NNG's handshake…"), instead of one sentence listing every possible
+  cause. Callers classifying these errors by type are unaffected. Callers
+  matching the old text must update.
+
 ## Unreleased: atomic validation for schematic edits (minor release)
 
 `edit_schematic_component`, `add_component_annotation`, and

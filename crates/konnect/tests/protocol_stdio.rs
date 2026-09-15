@@ -678,3 +678,37 @@ fn a_malformed_explicit_config_stops_startup_instead_of_falling_back() {
         "startup must not report any configuration selection: {stderr}"
     );
 }
+
+/// `ipc_failure` (#532) must reach a client over the real stdio protocol path,
+/// not only the in-process handler. The endpoint is a socket nothing listens
+/// on; the working directory and home are isolated so `KICAD_API_SOCKET` is
+/// the address that resolves.
+#[test]
+fn ipc_failure_kind_and_message_reach_the_client_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let address = format!("ipc://{}", tmp.path().join("no-kicad-here.sock").display());
+    let mut p = McpProcess::spawn_with_env(
+        Some(tmp.path()),
+        true,
+        &[("KICAD_API_SOCKET", address.as_str())],
+    );
+    McpProcess::tool_body(
+        &p.call_tool("load_toolset", json!({"name": ["project", "verification"]})),
+    );
+
+    for (tool, args) in [
+        ("check_kicad_ui", json!({"timeout_seconds": 60})),
+        ("open_project", json!({})),
+    ] {
+        let result = p.call_tool(tool, args);
+        assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(body["ipc_failure"]["kind"], "no_listener", "{tool}: {body}");
+        assert!(
+            body["ipc_failure"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Nothing is listening there")),
+            "{tool}: {body}"
+        );
+    }
+}
