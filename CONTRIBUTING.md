@@ -64,6 +64,21 @@ new tool.
 
 ## Pull request shape
 
+Include a short architectural-fit answer:
+
+> Does this change extend an existing KiCad capability or shared Konnect module?
+> If it introduces a workaround or duplicates behavior, explain why and when it
+> can be retired.
+
+Use the [architectural coordination tracker](https://github.com/mixelpixx/Konnect/issues/590)
+to find related investigations, shared-policy work, and compatibility retirement
+plans. Its horizon is proposed direction pending maintainer agreement, not a
+replacement for the roadmap or governance. Entries may exist without child
+issues or PRs until implementation is scoped. Short answers are sufficient;
+documentation-only changes may say not applicable. This is a design review
+signal, not a new requirement to redesign a subsystem or migrate unrelated
+legacy behavior before landing a focused fix.
+
 When changing a tool's behavior, follow the
 [reliability contract](docs/RELIABILITY_CONTRACT.md) and complete the affected
 behavior table in the PR template. It covers input/default handling, target and
