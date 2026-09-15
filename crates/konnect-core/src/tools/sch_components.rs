@@ -137,6 +137,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "datasheet": { "type": "string", "description": "New datasheet URL (optional)" },
                     "fields": {
                         "type": "object",
+                        "additionalProperties": true,
                         "description": "Additional property fields to set as key:value pairs"
                     },
                     "field_placements": {

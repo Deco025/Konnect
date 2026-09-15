@@ -188,6 +188,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "footprint": { "type": "string" },
                                 "fields": {
                                     "type": "object",
+                                    "additionalProperties": true,
                                     "description": "Additional property fields as key:value pairs"
                                 }
                             },

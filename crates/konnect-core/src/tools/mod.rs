@@ -95,9 +95,10 @@ impl ToolDef {
     pub fn new(
         name: &'static str,
         description: &'static str,
-        input_schema: Value,
+        mut input_schema: Value,
         handler: ToolHandlerFn,
     ) -> Self {
+        close_input_schema(&mut input_schema);
         let input_validator = compile_input_validator(name, &input_schema);
         Self {
             name,
@@ -123,7 +124,105 @@ impl ToolDef {
     }
 }
 
+/// Fixed tool argument records are closed by default. Caller-keyed maps opt in
+/// with explicit `additionalProperties: true` or a value schema. Visit schema
+/// keywords only: examples, defaults and arbitrary caller data are not schemas.
+/// Run before advertising AND compiling so clients see the enforced contract.
+pub(crate) fn close_input_schema(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    if object.get("type").is_some_and(|value| {
+        value == "object"
+            || value
+                .as_array()
+                .is_some_and(|types| types.iter().any(|t| t == "object"))
+    }) || object.contains_key("properties")
+        || object.contains_key("patternProperties")
+    {
+        object
+            .entry("additionalProperties")
+            .or_insert(Value::Bool(false));
+    }
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                close_input_schema(child);
+            }
+        }
+    }
+    for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_array_mut) {
+            for child in children {
+                close_input_schema(child);
+            }
+        }
+    }
+    for keyword in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+    ] {
+        if let Some(child) = object.get_mut(keyword) {
+            close_input_schema(child);
+        }
+    }
+}
+
 // Implement Debug manually because handler is not Debug
+#[cfg(test)]
+mod input_record_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn schema_policy_preserves_defaults_examples_and_explicit_maps() {
+        let data = json!({"type": "object", "properties": {"user": "data"}});
+        let mut schema = json!({
+            "type": "object", "default": data, "examples": [data],
+            "properties": {
+                "value": {},
+                "map": {"type": "object", "additionalProperties": true},
+                "typed_map": {"type": "object", "additionalProperties": {
+                    "type": "object", "properties": {"x": {"type": "number"}}
+                }},
+                "records": {"type": "array", "items": {"oneOf": [{
+                    "type": "object", "properties": {"x": {"type": "number"}}
+                }]}}
+            }
+        });
+        close_input_schema(&mut schema);
+        assert_eq!(schema["default"], data);
+        assert_eq!(schema["examples"], json!([data]));
+        assert_eq!(schema["properties"]["value"], json!({}));
+        assert_eq!(schema["properties"]["map"]["additionalProperties"], true);
+        assert_eq!(
+            schema["properties"]["typed_map"]["additionalProperties"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["records"]["items"]["oneOf"][0]["additionalProperties"],
+            false
+        );
+        let sealed = schema.clone();
+        close_input_schema(&mut schema);
+        assert_eq!(schema, sealed, "catalogue reconstruction is idempotent");
+    }
+}
+
 impl std::fmt::Debug for ToolDef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolDef")

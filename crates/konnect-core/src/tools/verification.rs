@@ -177,6 +177,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "dest_y": { "type": "number", "description": "Destination anchor Y (maps to src_y1)" },
                     "net_map": {
                         "type": "object",
+                        "additionalProperties": true,
                         "description": "Optional mapping from source net names to destination net names"
                     }
                 },

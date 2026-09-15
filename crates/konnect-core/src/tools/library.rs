@@ -138,9 +138,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Optional 3D model to associate with the footprint.",
                         "properties": {
                             "path": { "type": "string", "description": "Path to the 3D model file (.step/.wrl); absolute or a KiCAD env-var path like ${KICAD9_3DMODEL_DIR}/..." },
-                            "offset": { "type": "object", "description": "{x,y,z} in mm (default 0,0,0)" },
-                            "scale": { "type": "object", "description": "{x,y,z} (default 1,1,1)" },
-                            "rotate": { "type": "object", "description": "{x,y,z} in degrees (default 0,0,0)" }
+                            "offset": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "z": { "type": "number" } }, "description": "{x,y,z} in mm (default 0,0,0)" },
+                            "scale": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "z": { "type": "number" } }, "description": "{x,y,z} (default 1,1,1)" },
+                            "rotate": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "z": { "type": "number" } }, "description": "{x,y,z} in degrees (default 0,0,0)" }
                         },
                         "required": ["path"]
                     }
