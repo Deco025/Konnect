@@ -3,6 +3,30 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: explicit live-board synchronization for CLI DRC
+
+`run_drc` and `get_drc_violations` accept `sync_live_board: false` and
+`refill_zones: false` by default. Existing calls continue to check the saved
+file without requiring IPC. To check recent editor changes, finish other
+mutations first and call either tool with `sync_live_board: true`. Konnect binds
+the exact requested open board, optionally refills and waits for KiCad to stop
+returning `AS_BUSY`, saves that same document, verifies its native snapshot
+against the saved file, and only then runs CLI DRC. A changed source during DRC
+invalidates the result rather than being reported as synchronized evidence.
+
+Both summaries add `source: "saved_file"`, `live_board_synced`,
+`zones_refilled`, and `zone_refill_source` (`"ipc"`, `"kicad_cli"`, or null).
+These do not turn CLI DRC into an unsaved in-memory check. Without synchronization,
+CLI zone refill is analysis-only and does not save the open editor's board.
+Standalone `refill_zones` now binds its requested board, waits for completion,
+returns a structured refusal on failure, and reports `saved: false` on success.
+
+Wrong targets and unavailable IPC stop before mutation/CLI. Once refill/save
+has been attempted, failed or unproven work returns `mutation_outcome_uncertain`
+with the requested path and operation. Inspect/reconcile the editor and saved
+file before retrying; Konnect does not replay a possibly applied mutation or
+fall back to a different board. See [DRC synchronization](DRC_SYNCHRONIZATION.md).
+
 ## Unreleased: fixed tool arguments reject unknown keys (patch release)
 
 Following #551's validator, #546 closes fixed tool argument records before

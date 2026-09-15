@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub(crate) mod cross_probe;
 pub mod design_review;
+pub(crate) mod drc;
 pub mod editor_navigation;
 mod footprint_graphics;
 mod footprint_metadata;

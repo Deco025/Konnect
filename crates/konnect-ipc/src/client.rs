@@ -1656,6 +1656,26 @@ impl KiCadIpcClient {
         Ok(())
     }
 
+    /// Wait for the bound board to accept reads after an asynchronous operation.
+    /// Only KiCad's explicit AS_BUSY response is retried; mutations are never replayed.
+    pub fn wait_for_board_ready(&self, timeout: std::time::Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.get_board_document() {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    let busy = ApiStatusError::from_error(&error).is_some_and(|status| {
+                        status.code == kiapi::common::ApiStatusCode::AsBusy as i32
+                    });
+                    if !busy || std::time::Instant::now() >= deadline {
+                        return Err(error.context("board readiness could not be established"));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
     /// Save the open board document.
     pub fn save_board(&self) -> Result<()> {
         let doc = self.get_board_document()?;

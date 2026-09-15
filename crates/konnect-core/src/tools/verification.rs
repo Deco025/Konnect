@@ -6,13 +6,10 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
-use anyhow::Context;
 use konnect_sexp::writer::write_atomic;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::task;
-
-use super::cli;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -30,6 +27,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "output": { "type": "string", "description": "Optional path to write DRC report JSON" },
+                    "sync_live_board": { "type": "boolean", "default": false, "description": "Bind the requested open board, optionally refill, save and verify its persisted snapshot before CLI DRC. Finish other mutations first." },
+                    "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
                     "severity": {
                         "type": "string",
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
@@ -241,13 +240,17 @@ async fn handle_run_drc(
     let min_rank = severity_rank(severity_filter);
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
-    let refill = args["refill_zones"].as_bool().unwrap_or(false);
-    let report = cli::run_drc(&ctx.config.kicad_cli, &board, refill).await?;
+    let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
+        Ok(result) => result,
+        Err(error) => return Ok(error),
+    };
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
         let json = serde_json::to_string_pretty(&report)?;
-        write_report(out_path, &json).await?;
+        if let Err(error) = write_report(out_path, &json).await {
+            return super::drc::report_write_failure(&provenance, &board, out_path, error);
+        }
     }
 
     // Every category, not just `violations`. An unrouted net is reported under
@@ -267,6 +270,10 @@ async fn handle_run_drc(
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "total_violations": report.all().count(),
+            "source": provenance.source,
+            "live_board_synced": provenance.live_board_synced,
+            "zones_refilled": provenance.zones_refilled,
+            "zone_refill_source": provenance.zone_refill_source,
             "design_rule_violations": report.violations.len(),
             // Null, not zero, when this kicad-cli did not report the category:
             // "none found" and "never asked" are different answers.
@@ -301,16 +308,7 @@ async fn handle_run_drc(
 /// naming what was missing — the export tools next door already call
 /// `create_dir_all` first.
 async fn write_report(out_path: &str, contents: &str) -> anyhow::Result<()> {
-    let path = Path::new(out_path);
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("could not create report directory {}", parent.display()))?;
-    }
-    tokio::fs::write(path, contents)
-        .await
-        .with_context(|| format!("could not write report to {}", path.display()))?;
-    Ok(())
+    super::drc::write_report(out_path, contents).await
 }
 
 // ─── Design rules helpers ────────────────────────────────────────────────────
