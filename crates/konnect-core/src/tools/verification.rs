@@ -6,7 +6,6 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
-use anyhow::Context;
 use konnect_sexp::writer::write_atomic;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -309,16 +308,7 @@ async fn handle_run_drc(
 /// naming what was missing — the export tools next door already call
 /// `create_dir_all` first.
 async fn write_report(out_path: &str, contents: &str) -> anyhow::Result<()> {
-    let path = Path::new(out_path);
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("could not create report directory {}", parent.display()))?;
-    }
-    tokio::fs::write(path, contents)
-        .await
-        .with_context(|| format!("could not write report to {}", path.display()))?;
-    Ok(())
+    super::drc::write_report(out_path, contents).await
 }
 
 // ─── Design rules helpers ────────────────────────────────────────────────────

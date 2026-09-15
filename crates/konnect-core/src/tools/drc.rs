@@ -8,6 +8,24 @@ use std::{path::Path, time::Duration};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Publish by sibling-file replacement, never by truncating a destination inode.
+/// This also preserves the source board if an output path is a distinct hard link.
+pub(crate) async fn write_report(output: &str, contents: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let path = std::path::PathBuf::from(output);
+    let contents = contents.to_string();
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("could not create report directory {}", parent.display())
+            })?;
+        }
+        konnect_sexp::writer::write_atomic(&path, &contents)
+            .with_context(|| format!("could not write report to {}", path.display()))
+    })
+    .await?
+}
+
 #[derive(serde::Serialize)]
 pub(crate) struct DrcSourceEvidence {
     pub source: &'static str,
@@ -703,6 +721,31 @@ mod tests {
             assert_eq!(result["error"]["kind"], "invalid_argument");
             assert!(commands.lock().unwrap().is_empty());
             assert_eq!(std::fs::read_to_string(&board).unwrap(), OLD);
+        }
+    }
+
+    #[tokio::test]
+    async fn report_publication_does_not_truncate_a_hard_linked_board() {
+        for tool in ["run_drc", "get_drc_violations"] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("clock.kicad_pcb");
+            std::fs::write(&board, OLD).unwrap();
+            let executable = cli_fixture(dir.path(), &board);
+            let output = dir.path().join("report.json");
+            std::fs::hard_link(&board, &output).unwrap();
+            let result = call(
+                tool,
+                &board,
+                "",
+                &executable,
+                json!({"output":output.display().to_string()}),
+            )
+            .await;
+            assert_eq!(result["isError"], false, "{result}");
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), OLD);
+            let report: Value =
+                serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
+            assert!(report["violations"].as_array().unwrap().is_empty());
         }
     }
 

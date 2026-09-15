@@ -1077,15 +1077,7 @@ async fn handle_get_drc_violations(
     if let Some(out_path) = args["output"].as_str() {
         let publication = async {
             let json = serde_json::to_string_pretty(&report)?;
-            let path = std::path::Path::new(out_path);
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                tokio::fs::create_dir_all(parent).await.with_context(|| {
-                    format!("could not create report directory {}", parent.display())
-                })?;
-            }
-            tokio::fs::write(path, json)
-                .await
-                .with_context(|| format!("could not write report to {}", path.display()))?;
+            super::drc::write_report(out_path, &json).await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
