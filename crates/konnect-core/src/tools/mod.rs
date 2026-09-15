@@ -23,6 +23,7 @@ pub(crate) mod pcb_sync;
 pub mod placement;
 pub mod project;
 pub mod sch_analysis;
+pub(crate) mod sch_annotate;
 pub mod sch_batch;
 pub mod sch_bus;
 pub mod sch_components;

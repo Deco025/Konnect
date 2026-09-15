@@ -244,7 +244,7 @@ Crystal (Device:Crystal) between XI and XO pins. Two load capacitors from each c
 After placing components and wiring, always run these checks:
 
 ### annotate_schematic
-Assigns reference designators (R1, C1, U1, etc.) to all unannotated components. Run after all placement is complete.
+Numbers `?` designators the way eeschema's Tools → Annotate does (ascending X, first free number in the project, numbers reserved across every sheet instance in the file) and writes both places a designator lives. The units of one multi-unit part get one shared designator. Duplicated designators are **reported, not fixed**: read `unresolved` and the `outcome` — `partial` means the schematic still has a conflict — and pass `resolve_duplicates: true` to renumber all but the first of each group of separate parts; a shared designator that could be the units of one package is never renumbered, so fix those by hand. It annotates one project's instance records (the schematic's owner, or `project`) and never edits another project's; numbers used on the project's other sheets are reserved through its sheet tree (the response lists the sheets it consulted), but duplicates already spread across sheets are not detected, so annotate each sheet and then run `run_erc`. Run after all placement is complete; `dry_run: true` shows the plan first.
 
 ### validate_wire_connections
 Checks that all wires connect properly to pins. Reports:

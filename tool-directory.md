@@ -103,7 +103,7 @@ and Windows servers do not.
 | `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
 | `move_region` | Move all symbols within a bounding box by a given offset. |
-| `annotate_schematic` | Run kicad-cli to auto-assign reference designators (`R?` → `R1`, `U?` → `U1`, etc.). |
+| `annotate_schematic` | Number `?` designators the way eeschema's Tools → Annotate does (first free number in the project, ascending X per sheet instance, numbers reserved across every instance in the file, both places written). The units of one multi-unit part share one designator. Separate parts sharing a designator are reported as `unresolved` with a `partial` outcome, or renumbered with `resolve_duplicates`; a shared designator that could be a package is never renumbered. Annotates one project's instance records (`project`, default the schematic's owner). Konnect's own implementation; kicad-cli has no annotate command. |
 | `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on every placed unit, accounting for rotation/mirroring, plus each pin's `orientation_degrees` and `length_mm`. |
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |
 | `add_component_annotation` | Add or update a custom property across every placed unit of a component. |

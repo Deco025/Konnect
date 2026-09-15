@@ -255,11 +255,40 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "annotate_schematic",
-            "Run kicad-cli to auto-assign reference designators (R? → R1, U? → U1, etc.).",
+            "Assign reference designators in the saved schematic the way eeschema's Tools → \
+             Annotate does with its defaults: every '?' designator gets the first free number \
+             for its prefix in the project, in ascending X per sheet instance, numbers used on \
+             any sheet instance in the file are reserved, and numbered designators are kept. \
+             The units of one multi-unit part (same embedded definition and value, distinct \
+             units) share one designator; when which units belong together is not proven they \
+             are reported in 'unresolved', never guessed. Two separate parts sharing a \
+             designator are reported in 'unresolved' with a 'partial' outcome; they are \
+             renumbered only when resolve_duplicates is true (the first in ascending X keeps \
+             the number). Annotates one project's instance records — the schematic's owner by \
+             default, or 'project' — and never touches another project's. Writes both the \
+             Reference property and the instances block, then reads the file back; every count \
+             in the response comes from that readback. Numbers used on the project's other \
+             sheets are reserved through its sheet tree ('other_sheets_consulted'); duplicates \
+             already spread across sheets are not detected here. Konnect's own implementation \
+             — kicad-cli has no annotate command. dry_run returns the plan without writing.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string" }
+                    "schematic": { "type": "string", "description": "Path to the .kicad_sch file" },
+                    "resolve_duplicates": {
+                        "type": "boolean",
+                        "description": "Renumber separate single-unit parts that share a designator in the project: the first in ascending X keeps it, the rest get the first free number. Default false: duplicates are reported, not changed. A shared designator that could be the units of one multi-unit package is never renumbered either way.",
+                        "default": false
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Report what would be assigned without writing. Default false.",
+                        "default": false
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project whose instance records to annotate, as named in the symbols' (instances (project …)) blocks. Default: the project that owns the schematic (its .kicad_pro), else the only project the file names; refused with the candidates when that is ambiguous. Other projects' records are never edited."
+                    }
                 },
                 "required": ["schematic"]
             }),
@@ -3438,11 +3467,25 @@ async fn handle_move_region(
 
 async fn handle_annotate_schematic(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    use super::sch_annotate::{annotate_file, opt_bool, opt_string, AnnotateOptions};
     let sch_path = get_path(args, "schematic")?;
-    crate::tools::cli::annotate_schematic(&ctx.config.kicad_cli, &sch_path).await?;
-    Ok(CallToolResult::text("Annotation complete."))
+    let options = AnnotateOptions {
+        resolve_duplicates: match opt_bool(args, "resolve_duplicates") {
+            Ok(value) => value,
+            Err(refusal) => return Ok(refusal),
+        },
+        dry_run: match opt_bool(args, "dry_run") {
+            Ok(value) => value,
+            Err(refusal) => return Ok(refusal),
+        },
+        project: match opt_string(args, "project") {
+            Ok(value) => value,
+            Err(refusal) => return Ok(refusal),
+        },
+    };
+    Ok(tokio::task::spawn_blocking(move || annotate_file(&sch_path, options)).await?)
 }
 
 async fn handle_get_schematic_pin_locations(
