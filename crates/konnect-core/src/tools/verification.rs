@@ -12,8 +12,6 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::task;
 
-use super::cli;
-
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
@@ -30,6 +28,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "output": { "type": "string", "description": "Optional path to write DRC report JSON" },
+                    "sync_live_board": { "type": "boolean", "default": false, "description": "Bind the requested open board, optionally refill, save and verify its persisted snapshot before CLI DRC. Finish other mutations first." },
+                    "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
                     "severity": {
                         "type": "string",
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
@@ -241,8 +241,10 @@ async fn handle_run_drc(
     let min_rank = severity_rank(severity_filter);
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
-    let refill = args["refill_zones"].as_bool().unwrap_or(false);
-    let report = cli::run_drc(&ctx.config.kicad_cli, &board, refill).await?;
+    let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
+        Ok(result) => result,
+        Err(error) => return Ok(error),
+    };
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
@@ -267,6 +269,10 @@ async fn handle_run_drc(
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "total_violations": report.all().count(),
+            "source": provenance["source"],
+            "live_board_synced": provenance["live_board_synced"],
+            "zones_refilled": provenance["zones_refilled"],
+            "zone_refill_source": provenance["zone_refill_source"],
             "design_rule_violations": report.violations.len(),
             // Null, not zero, when this kicad-cli did not report the category:
             // "none found" and "never asked" are different answers.

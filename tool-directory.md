@@ -493,7 +493,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 3. **Cross-toolset cleanups** (historical notes):
    - `search_footprints` and `get_symbol_info` were originally in `verification`; moved to `library` where they belong semantically. Users who were loading `verification` for these will be auto-redirected by the smart "tool not loaded" error.
    - `get_drc_violations` (`pcb_export`) and `run_drc` (`verification`) run the same kicad-cli check. Their tool descriptions now cross-reference each other and steer the LLM toward `run_drc` for interactive use (cleaner summary with error/warning counts) and `get_drc_violations` for bundling into a build package.
-     Both go through `cli::run_drc`, which is also where item ownership is resolved, so the two cannot disagree about who owns a violation.
+     Both go through `tools::drc` for explicit `sync_live_board` / `refill_zones` ordering and source evidence, then `cli::run_drc` for parsing and item ownership. See [DRC synchronization](docs/DRC_SYNCHRONIZATION.md). Default calls remain saved-file checks; standalone refill waits for completion but does not save.
 
 ### Implementation notes
 
