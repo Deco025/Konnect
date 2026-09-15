@@ -2,6 +2,7 @@
   "schema_version": 1,
   "adopted_outcome_tools": [
     "add_schematic_component",
+    "annotate_schematic",
     "batch_place_components",
     "run_design_review"
   ],

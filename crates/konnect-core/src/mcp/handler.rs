@@ -1011,6 +1011,65 @@ mod reliability_contract_dispatch_tests {
     }
 }
 
+#[cfg(test)]
+mod annotate_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// `annotate_schematic`'s `outcome`, `assigned` and `unresolved` are
+    /// public response fields (#454); prove they survive the served
+    /// `tools/call` boundary on the KiCad-authored duplicate fixture.
+    #[tokio::test]
+    async fn annotate_outcome_and_unresolved_survive_the_served_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("annotate.kicad_sch");
+        std::fs::write(
+            &schematic,
+            include_str!("../../tests/fixtures/annotate_duplicates.kicad_sch"),
+        )
+        .unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "annotate_schematic",
+                    "arguments": {"schematic": schematic.display().to_string()}
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+        assert_eq!(body["outcome"]["status"], "partial", "{body}");
+        assert_eq!(body["assigned"].as_array().map(Vec::len), Some(2), "{body}");
+        assert_eq!(body["unresolved"][0]["reference"], "R1", "{body}");
+        assert_eq!(body["written"], true, "{body}");
+        // The fixture names one project and no .kicad_pro sits beside it, so
+        // that project is selected and reported.
+        assert_eq!(body["project"], "adj", "{body}");
+        assert_eq!(body["assigned"][0]["project"], "adj", "{body}");
+        assert_eq!(body["unresolved"][0]["project"], "adj", "{body}");
+    }
+}
+
 /// Turn a JSON Schema failure into Konnect's stable structured argument shape.
 /// Prefer a concrete nested leaf over an applicator (`oneOf`/`anyOf`) wrapper,
 /// and include an unexpected property's own name rather than only its parent.

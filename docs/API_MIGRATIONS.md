@@ -49,6 +49,67 @@ Tool authors must explicitly declare `additionalProperties: true` or a value
 schema for intentional caller-keyed maps. Catalogue tests inventory those
 exceptions. This changes refusals, not success-response shapes or tool counts.
 
+## Unreleased: `annotate_schematic` reports what it did, and numbers the way eeschema does (minor release)
+
+`annotate_schematic` returned the string "Annotation complete." whatever it
+had done, including nothing: two symbols that already shared a designator were
+never candidates, the file was left byte-identical, and KiCad's netlister then
+merged them into one component (#454). It also rewrote only the
+`(instances …)` reference of a `?` symbol and left its `(property "Reference"
+…)` behind, so KiCad and Konnect's own readers disagreed about the designator.
+
+The response is now JSON, with the shared `outcome` envelope:
+
+- `assigned` — one entry per `(uuid, unit, project, path, from, to)` that was
+  written;
+- `project` — the project whose instance records were annotated; `paths` —
+  its sheet instances in the file; `duplicates_before` and
+  `unannotated_before` — what the file looked like; `outside_project` —
+  symbols whose instance records name only other projects, left untouched;
+- `unresolved` — designator groups the tool will not decide for you, each with
+  its `project`, `paths`, `uuids` and a `reason`;
+- `written`, `dry_run`, `resolve_duplicates`, `remaining_unannotated`;
+- `outcome.status` is `complete` only when the committed file, read back, has
+  no `?` and no duplicate in the project; `partial` when `unresolved` is
+  non-empty; `failed` when the tool refused before writing; `uncertain` when
+  the write or the readback could not be proven.
+
+A caller matching "Annotation complete." must update. No argument was renamed
+or removed. Three optional arguments are added: `resolve_duplicates` (default
+false) renumbers all but the first of each group of separate parts sharing a
+designator, in ascending X, which is what eeschema's "Reset existing
+annotations" produced on the fixture; `dry_run` (default false) returns the
+plan without writing; `project` (string) names the project whose instance
+records to annotate.
+
+References are unique across a project (KiCad's flat list), so numbers are
+reserved per project across every sheet instance the file carries: a reused
+sheet's instances each get their own number, and a designator shared across
+instances is a duplicate unless it is the units of one package. Exactly one
+project's instance records are annotated — the schematic's owning project (its
+`.kicad_pro`, resolved the way #189 resolves ownership), else the only project
+the file names, else `project` — and anything ambiguous is refused with the
+candidates (`invalid_argument`, field `project`). Other projects' records are
+never edited. Multi-unit parts are recognised from the embedded library
+definition: units with the same definition and value, distinct within the
+declared unit count, are one package. Unannotated units of one package get one
+shared number; a shared designator that could be a package (a unit repeats, is
+out of range, the values differ, or the definition is missing) is never
+renumbered, even with `resolve_duplicates`, and is reported with a reason.
+When the owning project is proven, the numbers used on its other sheets are
+reserved by walking the sheet tree from the root (`other_sheets_consulted`
+lists them; `other_sheets_unreadable` names any that could not be read), so a
+child sheet annotated on its own never hands out a number the root owns.
+Duplicates that already exist across sheets are not detected or renumbered
+here; annotating a hierarchy from its root is tracked in #463.
+
+Numbering now follows eeschema's Tools → Annotate defaults, measured on
+eeschema 10.0.5 rather than assumed: ascending X per sheet instance, the first
+free number for a prefix (a gap between `R1` and `R3` is filled; before, the
+next number was always the maximum plus one), and `#`-prefixed designators
+spelled `#PWR01`, `#PWR010`, `#PWR0100` as eeschema spells them (before:
+`#PWR1`). Both places a designator lives are written.
+
 ## Unreleased: tool input schemas are enforced at dispatch (patch release)
 
 Konnect now compiles and caches every advertised Draft 2020-12 tool-input
