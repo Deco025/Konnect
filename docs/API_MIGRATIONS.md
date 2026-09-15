@@ -75,7 +75,13 @@ The response is now JSON, with the shared `outcome` envelope:
   the write or the readback could not be proven.
 
 A caller matching "Annotation complete." must update. No argument was renamed
-or removed. Three optional arguments are added: `resolve_duplicates` (default
+or removed. Persistence conflicts return `mutation_outcome_uncertain` with an
+`uncertain` outcome and `inspect_target` retry scope, not a no-write refusal:
+the conditional writer can detect a conflict either before replacement or
+after replacement during readback, without distinguishing that timing in its
+error. Reload and inspect the schematic before retrying; applied work is not
+known on this path and the response does not claim that nothing was written.
+Three optional arguments are added: `resolve_duplicates` (default
 false) renumbers all but the first of each group of separate parts sharing a
 designator, in ascending X, which is what eeschema's "Reset existing
 annotations" produced on the fixture; `dry_run` (default false) returns the

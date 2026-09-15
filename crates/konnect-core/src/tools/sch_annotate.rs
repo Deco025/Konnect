@@ -1054,6 +1054,17 @@ fn body(
 
 /// Annotate the schematic at `path` and report exactly what happened.
 pub(crate) fn annotate_file(path: &Path, options: AnnotateOptions) -> CallToolResult {
+    annotate_file_with_persistence(path, options, write_atomic_if_unchanged)
+}
+
+/// Keep persistence injectable so tests can exercise failures after an actual
+/// replacement without racing an external editor. Production uses the shared
+/// conditional atomic writer above.
+fn annotate_file_with_persistence(
+    path: &Path,
+    options: AnnotateOptions,
+    persist: impl FnOnce(&Path, &str, &str) -> Result<(), SexpError>,
+) -> CallToolResult {
     let content = match read_consistent(path) {
         Ok(content) => content,
         Err(SexpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1147,32 +1158,12 @@ pub(crate) fn annotate_file(path: &Path, options: AnnotateOptions) -> CallToolRe
         Err(reason) => return refused(path, &plan, &options, reason),
     }
 
-    match write_atomic_if_unchanged(path, &content, &prospective) {
+    match persist(path, &content, &prospective) {
         Ok(()) => {}
-        Err(SexpError::Conflict { path: conflicted }) => {
-            let result = CallToolResult::error_kind(
-                ToolErrorKind::Conflict {
-                    paths: vec![conflicted.display().to_string()],
-                },
-                format!(
-                    "{} changed while annotating; nothing was written. Reload and retry.",
-                    path.display()
-                ),
-            );
-            return outcome::attach(
-                result,
-                outcome::summary(
-                    OutcomeStatus::Failed,
-                    target,
-                    "saved_file",
-                    requested,
-                    0,
-                    requested,
-                    Some(outcome::retry_whole_request()),
-                ),
-            );
-        }
         Err(error) => {
+            // The shared writer can return Conflict before replacement OR
+            // after replacement when its readback differs. Without timing
+            // evidence, no persistence error proves that nothing was applied.
             let result = crate::tools::mutation_outcome_uncertain(
                 path,
                 OPERATION,
@@ -1313,6 +1304,45 @@ mod tests {
     use super::*;
     use crate::mcp::error::extract_error_kind;
     use crate::mcp::protocol::ToolContent;
+
+    #[test]
+    fn persistence_conflicts_require_inspection_before_retry() {
+        for after_replacement in [true, false] {
+            let (_dir, path) = write_fixture(BEFORE);
+            let result = annotate_file_with_persistence(
+                &path,
+                AnnotateOptions::default(),
+                |target, expected, prospective| {
+                    if after_replacement {
+                        // Execute the real conditional atomic replacement, then
+                        // simulate the writer's post-write readback conflict.
+                        write_atomic_if_unchanged(target, expected, prospective).unwrap();
+                    }
+                    Err(SexpError::Conflict {
+                        path: target.to_path_buf(),
+                    })
+                },
+            );
+            let saved = std::fs::read_to_string(&path).unwrap();
+            if after_replacement {
+                assert_eq!(designators(&saved), designators(KICAD_KEEP));
+            } else {
+                assert_eq!(saved, BEFORE);
+            }
+            let body = response_json(&result);
+            assert_eq!(body["outcome"]["status"], "uncertain", "{body}");
+            assert_eq!(
+                body["outcome"]["retry"],
+                outcome::inspect_before_retry(),
+                "{body}"
+            );
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("mutation_outcome_uncertain")
+            );
+            assert!(!text_of(&result).contains("nothing was written"));
+        }
+    }
 
     /// Built through Konnect's tools, re-serialised by `kicad-cli sch upgrade`
     /// (eeschema, version 20260306): three `R1` (1k at x=101.6, 2k at
