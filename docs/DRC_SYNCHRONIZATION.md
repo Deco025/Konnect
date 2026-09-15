@@ -24,6 +24,7 @@ before each operation; another open board is never substituted.
 | Failed refill/save or unprovable persistence | `mutation_outcome_uncertain`; stop before CLI; inspect/reconcile editor and file before retry. |
 | CLI failure after save or source changed during DRC | No accepted DRC result; structured uncertainty with recovery instructions. Already applied work is not replayed. |
 | Wrong-typed/unknown options | Served schema validation rejects before the handler; no write. |
+| Optional report output | Source-board aliases and obvious directory/non-directory-ancestor destinations are refused before mutation. Later publication failure preserves the completed `source_evidence` receipt and board path, and tells the caller not to repeat refill/save. |
 | Standalone refill | Exact target -> refill -> readiness; success does not mean saved. Failure is an MCP error, not a success containing `success:false`. |
 
 KiCad explicitly acknowledges `RefillZones` immediately and returns `AS_BUSY`
@@ -53,8 +54,10 @@ standalone refill and a readiness deadline without replay.
 
 The ignored live regression requires a **disposable copy**, already open in
 KiCad, with a named net. It creates/saves a via, deletes it without saving,
-proves file-only DRC still reports its UUID, and proves both synchronized tools
-remove it after refill/save. Set `KONNECT_LIVE_KICAD_BOARD`, `KICAD_API_SOCKET`,
+proves file-only DRC still reports its UUID, adds an unfilled native copper zone,
+and proves both synchronized tools remove the UUID and compute actual copper
+after refill/save. The fixture needs a line-based board outline and named-net
+copper inside that outline. Set `KONNECT_LIVE_KICAD_BOARD`, `KICAD_API_SOCKET`,
 and `KONNECT_TEST_KICAD_CLI`, then run:
 
 ```text

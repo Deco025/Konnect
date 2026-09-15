@@ -249,7 +249,9 @@ async fn handle_run_drc(
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
         let json = serde_json::to_string_pretty(&report)?;
-        write_report(out_path, &json).await?;
+        if let Err(error) = write_report(out_path, &json).await {
+            return super::drc::report_write_failure(&provenance, &board, out_path, error);
+        }
     }
 
     // Every category, not just `violations`. An unrouted net is reported under
@@ -269,10 +271,10 @@ async fn handle_run_drc(
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "total_violations": report.all().count(),
-            "source": provenance["source"],
-            "live_board_synced": provenance["live_board_synced"],
-            "zones_refilled": provenance["zones_refilled"],
-            "zone_refill_source": provenance["zone_refill_source"],
+            "source": provenance.source,
+            "live_board_synced": provenance.live_board_synced,
+            "zones_refilled": provenance.zones_refilled,
+            "zone_refill_source": provenance.zone_refill_source,
             "design_rule_violations": report.violations.len(),
             // Null, not zero, when this kicad-cli did not report the category:
             // "none found" and "never asked" are different answers.

@@ -1075,16 +1075,23 @@ async fn handle_get_drc_violations(
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
-        let json = serde_json::to_string_pretty(&report)?;
-        let path = std::path::Path::new(out_path);
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("could not create report directory {}", parent.display())
-            })?;
+        let publication = async {
+            let json = serde_json::to_string_pretty(&report)?;
+            let path = std::path::Path::new(out_path);
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                tokio::fs::create_dir_all(parent).await.with_context(|| {
+                    format!("could not create report directory {}", parent.display())
+                })?;
+            }
+            tokio::fs::write(path, json)
+                .await
+                .with_context(|| format!("could not write report to {}", path.display()))?;
+            Ok::<(), anyhow::Error>(())
         }
-        tokio::fs::write(path, json)
-            .await
-            .with_context(|| format!("could not write report to {}", path.display()))?;
+        .await;
+        if let Err(error) = publication {
+            return super::drc::report_write_failure(&provenance, &board, out_path, error);
+        }
     }
 
     let filtered: Vec<_> = report
@@ -1094,10 +1101,10 @@ async fn handle_get_drc_violations(
 
     let summary = json!({
         "total": report.all().count(),
-        "source": provenance["source"],
-        "live_board_synced": provenance["live_board_synced"],
-        "zones_refilled": provenance["zones_refilled"],
-        "zone_refill_source": provenance["zone_refill_source"],
+        "source": provenance.source,
+        "live_board_synced": provenance.live_board_synced,
+        "zones_refilled": provenance.zones_refilled,
+        "zone_refill_source": provenance.zone_refill_source,
         "design_rule_violations": report.violations.len(),
         "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
         "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),

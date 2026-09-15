@@ -8,6 +8,35 @@ use std::{path::Path, time::Duration};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[derive(serde::Serialize)]
+pub(crate) struct DrcSourceEvidence {
+    pub source: &'static str,
+    pub live_board_synced: bool,
+    pub zones_refilled: bool,
+    pub zone_refill_source: Option<&'static str>,
+}
+
+/// Preserve completed work when optional report publication fails afterwards.
+pub(crate) fn report_write_failure(
+    evidence: &DrcSourceEvidence,
+    board: &Path,
+    output: &str,
+    error: anyhow::Error,
+) -> anyhow::Result<CallToolResult> {
+    if !evidence.live_board_synced {
+        return Err(error);
+    }
+    let body = json!({
+        "error": ToolErrorKind::HandlerError { reason: format!("could not write DRC report to {output}: {error:#}") },
+        "source_evidence": evidence,
+        "board": board.display().to_string(),
+        "message": "Board synchronization and CLI DRC completed, but optional report publication failed. Do not repeat refill/save blindly; correct the output destination and recover the report from the already-saved board.",
+    });
+    let mut result = CallToolResult::json(&body);
+    result.is_error = true;
+    Ok(result)
+}
+
 fn uncertain(board: &Path, operation: &str, reason: impl std::fmt::Display) -> CallToolResult {
     CallToolResult::error_kind(
         ToolErrorKind::MutationOutcomeUncertain {
@@ -55,7 +84,7 @@ pub(crate) async fn run(
     ctx: &ToolContext,
     board: &Path,
     args: &Value,
-) -> anyhow::Result<Result<(cli::DrcReport, Value), CallToolResult>> {
+) -> anyhow::Result<Result<(cli::DrcReport, DrcSourceEvidence), CallToolResult>> {
     let option = |field: &str| -> Result<bool, CallToolResult> {
         match args.get(field) {
             None => Ok(false),
@@ -74,6 +103,30 @@ pub(crate) async fn run(
         (Ok(sync), Ok(refill)) => (sync, refill),
         (Err(error), _) | (_, Err(error)) => return Ok(Err(error)),
     };
+    // Refuse obvious publication errors before any live save/refill. Later
+    // permission changes or filesystem races still need applied-state recovery.
+    if let Some(output) = args["output"].as_str() {
+        let output_path = Path::new(output);
+        let same_board = match (output_path.canonicalize(), board.canonicalize()) {
+            (Ok(output), Ok(board)) => output == board,
+            _ => output_path == board,
+        };
+        let invalid = same_board
+            || output_path.is_dir()
+            || output_path
+                .ancestors()
+                .skip(1)
+                .any(|parent| parent.is_file());
+        if invalid {
+            return Ok(Err(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "output".into(),
+                        reason: "destination aliases the source board, is a directory or has a non-directory ancestor".into(),
+                },
+                "Choose a writable report file path. No refill, save or CLI DRC was started.",
+            )));
+        }
+    }
     let mut saved_snapshot = None;
     if sync {
         let path = board.to_path_buf();
@@ -127,12 +180,16 @@ pub(crate) async fn run(
     }
     Ok(Ok((
         report,
-        json!({
-            "source": "saved_file",
-            "live_board_synced": sync,
-            "zones_refilled": refill,
-            "zone_refill_source": if refill { Some(if sync { "ipc" } else { "kicad_cli" }) } else { None },
-        }),
+        DrcSourceEvidence {
+            source: "saved_file",
+            live_board_synced: sync,
+            zones_refilled: refill,
+            zone_refill_source: if refill {
+                Some(if sync { "ipc" } else { "kicad_cli" })
+            } else {
+                None
+            },
+        },
     )))
 }
 
@@ -310,6 +367,12 @@ mod tests {
                     } else {
                         if mode != "stale" {
                             std::fs::write(&path, LIVE).unwrap();
+                        }
+                        if mode == "report-fail" {
+                            let report = path.with_extension("report");
+                            if !report.exists() {
+                                std::fs::create_dir(report).unwrap();
+                            }
                         }
                         response(None, false)
                     }
@@ -572,6 +635,77 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn served_report_failure_preserves_completed_sync_receipt_and_preflights_obvious_errors()
+    {
+        for tool in ["run_drc", "get_drc_violations"] {
+            for preexisting in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let board = dir.path().join("clock.kicad_pcb");
+                std::fs::write(&board, OLD).unwrap();
+                let executable = cli_fixture(dir.path(), &board);
+                let output = board.with_extension("report");
+                if preexisting {
+                    std::fs::create_dir(&output).unwrap();
+                }
+                let commands = Arc::new(Mutex::new(Vec::new()));
+                let server = mock(&board, commands.clone(), "report-fail");
+                let result = call(
+                    tool,
+                    &board,
+                    server.address(),
+                    &executable,
+                    json!({"sync_live_board":true,"output":output.display().to_string()}),
+                )
+                .await;
+                assert_eq!(result["isError"], true, "{result}");
+                if preexisting {
+                    assert_eq!(result["error"]["kind"], "invalid_argument");
+                    assert!(commands.lock().unwrap().is_empty());
+                    assert_eq!(std::fs::read_to_string(&board).unwrap(), OLD);
+                } else {
+                    assert_eq!(result["error"]["kind"], "handler_error");
+                    assert_eq!(result["source_evidence"]["live_board_synced"], true);
+                    assert_eq!(result["source_evidence"]["source"], "saved_file");
+                    assert_eq!(std::fs::read_to_string(&board).unwrap(), LIVE);
+                    assert_eq!(
+                        commands
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|s| s.ends_with("SaveDocument"))
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn report_output_cannot_replace_the_source_board() {
+        for tool in ["run_drc", "get_drc_violations"] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("clock.kicad_pcb");
+            std::fs::write(&board, OLD).unwrap();
+            let executable = cli_fixture(dir.path(), &board);
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let server = mock(&board, commands.clone(), "ok");
+            let result = call(
+                tool,
+                &board,
+                server.address(),
+                &executable,
+                json!({"sync_live_board":true,"output":board.display().to_string()}),
+            )
+            .await;
+            assert_eq!(result["isError"], true);
+            assert_eq!(result["error"]["kind"], "invalid_argument");
+            assert!(commands.lock().unwrap().is_empty());
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), OLD);
+        }
+    }
+
     /// Requires a disposable, already-open KiCad 10 board, never a working design.
     #[tokio::test]
     #[ignore = "requires disposable live KiCad board and KICAD_API_SOCKET"]
@@ -612,6 +746,66 @@ mod tests {
             .unwrap()
             .to_string();
         client.delete_items(vec![uuid.clone()]).unwrap();
+        // Add an unfilled native copper zone as a second observable outcome:
+        // a refill acknowledgement alone must not pass the live regression.
+        let corners: Vec<_> = tree
+            .find_all("gr_line")
+            .into_iter()
+            .filter(|node| {
+                node.find("layer")
+                    .and_then(|layer| layer.get(1))
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    == Some("Edge.Cuts")
+            })
+            .flat_map(|node| [node.find("start"), node.find("end")])
+            .flatten()
+            .map(|point| (point.get_f64(1).unwrap(), point.get_f64(2).unwrap()))
+            .collect();
+        assert!(
+            !corners.is_empty(),
+            "native fixture must have a line-based board outline"
+        );
+        let left = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min) + 0.5;
+        let right = corners
+            .iter()
+            .map(|p| p.0)
+            .fold(f64::NEG_INFINITY, f64::max)
+            - 0.5;
+        let top = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min) + 0.5;
+        let bottom = corners
+            .iter()
+            .map(|p| p.1)
+            .fold(f64::NEG_INFINITY, f64::max)
+            - 0.5;
+        let points = [(left, top), (right, top), (right, bottom), (left, bottom)];
+        let zone = konnect_ipc::builders::build_zone(
+            &konnect_ipc::builders::ZoneSpec {
+                layer: "F.Cu",
+                net_name: &net.name,
+                points: &points,
+                clearance_mm: 0.3,
+                min_thickness_mm: 0.25,
+                name: "issue408-live-refill",
+                priority: 1,
+                connection: kiapi::board::types::ZoneConnectionStyle::ZcsFull,
+            },
+            net.netcode,
+        );
+        assert!(!zone.filled && zone.filled_polygons.is_empty());
+        let created = client
+            .create_items_returning(vec![konnect_ipc::builders::pack_any(
+                &zone,
+                "kiapi.board.types.Zone",
+            )])
+            .unwrap();
+        let zone_id = created
+            .iter()
+            .map(|item| kiapi::board::types::Zone::decode(item.value.as_slice()).unwrap())
+            .next()
+            .unwrap()
+            .id
+            .unwrap()
+            .value;
         assert!(
             std::fs::read_to_string(&board).unwrap().contains(&uuid),
             "deletion must still be unsaved for this regression"
@@ -646,6 +840,18 @@ mod tests {
                 "deleted UUID survived synchronized DRC"
             );
             assert!(!std::fs::read_to_string(&board).unwrap().contains(&uuid));
+            let zones = client
+                .get_items(kiapi::common::types::KiCadObjectType::KotPcbZone)
+                .unwrap();
+            let observed = zones
+                .iter()
+                .map(|item| kiapi::board::types::Zone::decode(item.value.as_slice()).unwrap())
+                .find(|zone| zone.id.as_ref().is_some_and(|id| id.value == zone_id))
+                .expect("created zone");
+            assert!(
+                observed.filled && !observed.filled_polygons.is_empty(),
+                "refill must actually compute copper"
+            );
         }
     }
 }
