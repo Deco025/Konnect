@@ -3,6 +3,28 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: fixed tool arguments reject unknown keys (patch release)
+
+Following #551's validator, #546 closes fixed tool argument records before
+advertising and compiling their schemas. Unknown top-level arguments and unknown
+fields in fixed nested records now return `invalid_argument` before a handler
+runs. For example, use `query` rather than `part_name` in `search_symbols`, and
+`rotation` rather than `rotaton` in `create_footprint.pads`. A missing required
+field still takes precedence over other validation errors. Correct the named
+field using the current `tools/list` schema, then retry; a refusal writes nothing.
+
+Intentional caller-keyed maps remain extensible: schematic custom `fields`,
+field-name keys in `field_placements`, routing `net_map`, and template
+`net_mappings`. Fixed placement records inside `field_placements` are closed.
+Arbitrary configuration `value` data remains unrestricted. The optional footprint
+model `offset`, `scale`, and `rotate` records now declare numeric `x`, `y`, `z`
+fields; omission keeps the existing coordinate defaults.
+
+Previously ignored extension keys on fixed records are no longer accepted.
+Tool authors must explicitly declare `additionalProperties: true` or a value
+schema for intentional caller-keyed maps. Catalogue tests inventory those
+exceptions. This changes refusals, not success-response shapes or tool counts.
+
 ## Unreleased: tool input schemas are enforced at dispatch (patch release)
 
 Konnect now compiles and caches every advertised Draft 2020-12 tool-input

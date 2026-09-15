@@ -253,6 +253,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "position_y": { "type": "number", "description": "Y position to place the subcircuit (mm)", "default": 100.0 },
                     "net_mappings": {
                         "type": "object",
+                        "additionalProperties": true,
                         "description": "Map template net names to your project's net names. E.g. {\"VUSB\": \"VCC_5V\", \"GND\": \"GND\"}"
                     },
                     "ref_start": {

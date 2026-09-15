@@ -395,6 +395,16 @@ convention for other `kicad-cli`-calling code.
 
 ## Adding a New Tool
 
+Fixed input records are closed by `ToolDef::new` before the schema is advertised
+and compiled. Declare all accepted fields in `properties`, including fixed
+nested records. Intentional caller-keyed maps must explicitly set
+`additionalProperties: true` or a value schema; register a new exception in
+`fixed_records_are_closed_and_only_reviewed_maps_are_extensible` with a
+compatibility test. A typed map's fixed value records are still closed. Untyped
+caller data such as configuration `value` remains unrestricted. The same policy
+applies to meta-tools. Use the served dispatch for typo/no-write regressions;
+direct handler calls still require checked readers for their domain rules.
+
 1. Add the `tool!(...)` definition to the appropriate toolset's `tools()` vec
 2. Write the `async fn handle_*()` handler below the tools vec
 3. Update `tool_count` in `router/registry.rs::ALL_TOOLSETS` — this is the declared count shown in `list_toolboxes`

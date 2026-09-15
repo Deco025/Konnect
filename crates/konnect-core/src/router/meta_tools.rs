@@ -307,9 +307,10 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
         },
     ];
 
+    #[allow(unused_mut)]
+    let mut descriptions = descriptions;
     #[cfg(unix)]
     {
-        let mut descriptions = descriptions;
         if reload_enabled {
             descriptions.push(McpToolDescription {
             name: "reload_server".to_string(),
@@ -332,14 +333,16 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
             }),
             });
         }
-        descriptions
     }
 
     #[cfg(not(unix))]
     {
         let _ = reload_enabled;
-        descriptions
     }
+    for tool in &mut descriptions {
+        crate::tools::close_input_schema(&mut tool.input_schema);
+    }
+    descriptions
 }
 
 /// Attempt to handle a meta-tool call. Returns `None` if the name is not a meta-tool.

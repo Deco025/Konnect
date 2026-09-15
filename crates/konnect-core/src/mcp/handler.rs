@@ -1362,7 +1362,7 @@ mod schema_validation_dispatch_tests {
     }
 
     #[tokio::test]
-    async fn unknown_keys_remain_allowed_where_the_schema_is_open() {
+    async fn a_pad_typo_is_refused_without_creating_a_footprint() {
         let handler = handler().await;
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("open-schema.kicad_mod");
@@ -1386,12 +1386,108 @@ mod schema_validation_dispatch_tests {
             )
             .await;
 
-        assert_ne!(kind.as_deref(), Some("invalid_argument"));
-        assert!(
-            !result.is_error,
-            "open schemas retain their declared behavior"
-        );
-        assert!(output.is_file());
+        assert_eq!(kind.as_deref(), Some("invalid_argument"));
+        assert!(result.is_error);
+        assert_eq!(error_json(&result)["error"]["field"], "pads[0].rotaton");
+        assert!(!output.exists(), "refusal must precede creation");
+        let (result, _, _) = handler
+            .dispatch_tool(
+                "create_footprint",
+                &json!({
+                    "output": output.display().to_string(), "name": "Corrected",
+                    "pads": [{"number": "1", "type": "smd", "shape": "rect", "x": 0, "y": 0,
+                        "width": 1, "height": 1, "rotation": 90}]
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(std::fs::read_to_string(&output)
+            .unwrap()
+            .contains("(at 0 0 90)"));
+    }
+
+    #[tokio::test]
+    async fn a_search_argument_typo_is_refused_over_json_rpc() {
+        let handler = handler().await;
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 546, "method": "tools/call",
+                "params": {"name": "search_symbols", "arguments": {"query": "R", "part_name": "R"}}
+            }))
+            .await
+            .unwrap();
+        let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(result.is_error);
+        let body = error_json(&result);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "part_name");
+    }
+
+    #[tokio::test]
+    async fn meta_tool_typos_are_refused() {
+        let handler = handler().await;
+        assert_invalid_field(&handler, "get_recent_calls", json!({"limti": 5}), "limti").await;
+    }
+
+    #[tokio::test]
+    async fn custom_fields_and_fixed_field_placements_have_distinct_contracts() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let schematic = directory.path().join("ecc83.kicad_sch");
+        let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        std::fs::write(&schematic, source).unwrap();
+        let args = json!({
+            "schematic": schematic.display().to_string(), "reference": "U1",
+            "fields": {"My private supplier": "Example Electronics"}
+        });
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 547, "method": "tools/call",
+                "params": {"name": "edit_schematic_component", "arguments": args}
+            }))
+            .await
+            .unwrap();
+        let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&schematic).unwrap();
+        assert!(after.contains("(property \"My private supplier\" \"Example Electronics\""));
+        assert_invalid_field(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": schematic.display().to_string(), "reference": "U1",
+                "field_placements": {"My private supplier": {"rotaton": 90}}
+            }),
+            "field_placements.My private supplier.rotaton",
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(&schematic).unwrap(), after);
+    }
+
+    #[tokio::test]
+    async fn net_maps_and_arbitrary_configuration_values_remain_accepted() {
+        let handler = handler().await;
+        for (tool, args) in [
+            (
+                "apply_template",
+                json!({"schematic": "missing.kicad_sch", "template_id": "ldo_3v3", "net_mappings": {"My net": "Other net"}}),
+            ),
+            (
+                "copy_routing_pattern",
+                json!({"board": "missing.kicad_pcb", "src_x1": 0, "src_y1": 0, "src_x2": 1, "src_y2": 1, "dest_x": 2, "dest_y": 2, "net_map": {"My net": "Other net"}}),
+            ),
+        ] {
+            let (_, _, kind) = handler.dispatch_tool(tool, &args).await;
+            assert_ne!(kind.as_deref(), Some("invalid_argument"), "{tool}");
+        }
+        // No write to real preferences: test the advertised validator directly.
+        let tool = handler
+            .ctx
+            .router
+            .get_tool("save_user_config")
+            .await
+            .unwrap();
+        assert!(tool.input_validator.is_valid(&json!({"key_path": "private", "value": {"properties": {"type": "object", "free": [1, 2]}}})));
     }
 }
 
