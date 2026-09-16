@@ -1857,6 +1857,50 @@ mod tests {
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
     }
 
+    /// Synthetic variant derived from the KiCad-authored fixture: the four
+    /// `gr_line` Edge.Cuts segments forming the 60×45 rectangle are replaced
+    /// with a single `gr_poly` tracing the same four corners. Nothing else
+    /// changes, so this reproduces
+    /// `kicad_fixture_passes_at_70_with_only_the_decoupling_deduction`
+    /// exactly if (and only if) `board_outline_bbox` recognizes `gr_poly`
+    /// (#593).
+    #[tokio::test]
+    async fn gr_poly_outline_is_recognized_same_as_gr_line_rectangle() {
+        let fixture = std::fs::read_to_string(FIXTURE).unwrap();
+        let start = fixture.find("(gr_line").expect("fixture has an outline");
+        let end = fixture[start..]
+            .find("(segment")
+            .map(|offset| start + offset)
+            .expect("outline precedes the routed segment");
+        assert_eq!(
+            fixture[start..end].matches("(gr_line").count(),
+            4,
+            "expected exactly the 4 rectangle edges between outline and segment"
+        );
+
+        let poly = "(gr_poly\n\t\t(pts\n\t\t\t\
+             (xy 0 0) (xy 60 0) (xy 60 45) (xy 0 45)\n\t\t)\n\t\t(stroke\n\t\t\t\
+             (width 0.05)\n\t\t\t(type default)\n\t\t)\n\t\t(fill no)\n\t\t\
+             (layer \"Edge.Cuts\")\n\t\t(uuid \"c3b6f5f2-6c1b-4e6a-9f9a-2a1c9f6b0a11\")\n\t)\n\t";
+        let mut converted = String::with_capacity(fixture.len());
+        converted.push_str(&fixture[..start]);
+        converted.push_str(poly);
+        converted.push_str(&fixture[end..]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gr_poly_outline.kicad_pcb");
+        std::fs::write(&path, converted).unwrap();
+
+        let response = score(&path).await;
+        assert_eq!(response["outline_missing"], false, "{response}");
+        assert_eq!(response["verdict"], "pass", "{response}");
+        assert_eq!(response["score"], 70);
+        let edges = response["connector_edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["reference"], "J1");
+        assert_eq!(edges[0]["edge_distance_mm"], 8.81);
+    }
+
     /// Move ONE footprint's root anchor by string surgery on the
     /// KiCad-authored fixture, the way
     /// `overlapping_courtyards_are_a_hard_fail_naming_the_pair` does: the
