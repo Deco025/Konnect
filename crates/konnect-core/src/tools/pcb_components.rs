@@ -2039,7 +2039,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_component_pads",
-            "Return live board-space pad positions, layers and net assignments for a footprint. \
+            "Return live board-space pad positions, effective rotations, physical geometry, drills, \
+             copper-layer shapes, layers and net assignments for a footprint. \
              Reads the board open in KiCad when it is reachable and falls back to the file only \
              when no live KiCad holds this board — IPC unreachable, or that board not open — \
              'source' says which, so unsaved placements are visible without a save. \
@@ -2059,7 +2060,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "get_pad_position",
-            "Return the live board-space position, layers and net of a specific pad number on a footprint.",
+            "Return the live board-space position, effective rotation, physical geometry, drill, \
+             layers and net of a specific pad number on a footprint.",
             json!({
                 "type": "object",
                 "properties": {
@@ -3188,6 +3190,129 @@ fn saved_pad_count(board_path: &std::path::Path, reference: &str) -> Option<usiz
         .map(|fp| fp.find_all("pad").len())
 }
 
+fn file_pad_drill(pad: &konnect_sexp::SexpNode) -> Option<konnect_ipc::IpcPadDrill> {
+    let drill = pad.find("drill")?;
+    let oval = drill.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("oval");
+    let first = if oval { 2 } else { 1 };
+    let x = drill.get_f64(first)?;
+    let y = drill.get_f64(first + 1).unwrap_or(x);
+    Some(konnect_ipc::IpcPadDrill {
+        shape: Some(if oval { "oval" } else { "circle" }.to_string()),
+        size: Some(konnect_ipc::IpcVector2 { x, y }),
+        // The serialized pad drill does not independently name a layer span.
+        // Do not turn the pad's wildcard/copper layer list into measured drill
+        // endpoints; live IPC provides those when KiCad exposes them.
+        start_layer: None,
+        end_layer: None,
+    })
+}
+
+/// Parse the geometry KiCad saved for one pad and express it in the same typed
+/// shape returned by the live IPC path.
+///
+/// `x`, `y`, and `rotation_deg` are already in the caller's declared coordinate
+/// space: board-space for `get_component_pads`, footprint-local for library
+/// inspection.  Keeping this serializer shared prevents the two file readers
+/// from drifting as new native pad fields are exposed.
+pub(crate) fn pad_info_from_sexp(
+    pad: &konnect_sexp::SexpNode,
+    x: f64,
+    y: f64,
+    rotation_deg: f64,
+    net: String,
+) -> anyhow::Result<konnect_ipc::IpcPad> {
+    let number = pad
+        .get(1)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .context("pad has no readable number")?
+        .to_string();
+    let pad_type = pad
+        .get(2)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .and_then(|kind| {
+            match kind {
+                "thru_hole" => Some("thru_hole"),
+                "smd" => Some("smd"),
+                "connect" => Some("edge_connector"),
+                "np_thru_hole" => Some("np_thru_hole"),
+                _ => None,
+            }
+            .map(str::to_string)
+        });
+    let shape = pad
+        .get(3)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .and_then(|shape| {
+            matches!(
+                shape,
+                "circle"
+                    | "rect"
+                    | "oval"
+                    | "trapezoid"
+                    | "roundrect"
+                    | "chamfered_rect"
+                    | "custom"
+            )
+            .then(|| shape.to_string())
+        });
+    let size = pad.find("size").and_then(|size| {
+        Some(konnect_ipc::IpcVector2 {
+            x: size.get_f64(1)?,
+            y: size.get_f64(2)?,
+        })
+    });
+    let layers: Vec<String> = pad
+        .find("layers")
+        .and_then(konnect_sexp::SexpNode::children)
+        .unwrap_or_default()
+        .iter()
+        .skip(1)
+        .filter_map(konnect_sexp::SexpNode::as_str)
+        .map(str::to_string)
+        .collect();
+    let offset = pad.find("offset").and_then(|offset| {
+        Some(konnect_ipc::IpcVector2 {
+            x: offset.get_f64(1)?,
+            y: offset.get_f64(2)?,
+        })
+    });
+    let corner_rounding_ratio = pad
+        .find("roundrect_rratio")
+        .and_then(|node| node.get_f64(1));
+    let chamfer_ratio = pad.find("chamfer_ratio").and_then(|node| node.get_f64(1));
+    let copper_layers = layers
+        .iter()
+        .filter(|layer| layer.as_str() == "*.Cu" || layer.ends_with(".Cu"))
+        .map(|layer| konnect_ipc::IpcPadLayerGeometry {
+            layer: layer.clone(),
+            shape: shape.clone(),
+            size: size.clone(),
+            offset: offset.clone(),
+            corner_rounding_ratio,
+            chamfer_ratio,
+        })
+        .collect();
+    let uuid = pad
+        .find_str("uuid")
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_string);
+
+    Ok(konnect_ipc::IpcPad {
+        uuid,
+        number,
+        x,
+        y,
+        net,
+        layers,
+        pad_type,
+        rotation_deg: Some(rotation_deg),
+        shape,
+        size,
+        drill: file_pad_drill(pad),
+        copper_layers,
+    })
+}
+
 async fn handle_get_component_pads(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -3214,15 +3339,7 @@ async fn handle_get_component_pads(
         Ok(Some(pads)) if !pads.is_empty() => {
             let items: Vec<serde_json::Value> = pads
                 .iter()
-                .map(|pad| {
-                    json!({
-                        "number": pad.number,
-                        "x": pad.x,
-                        "y": pad.y,
-                        "net": pad.net,
-                        "layers": pad.layers
-                    })
-                })
+                .map(|pad| serde_json::to_value(pad).expect("IpcPad is serializable"))
                 .collect();
             return Ok(CallToolResult::json(&json!({
                 "reference": reference,
@@ -3303,48 +3420,64 @@ async fn handle_get_component_pads(
     let fp_y = fp_at.and_then(|a| a.get_f64(2)).unwrap_or(0.0);
     let fp_rot = fp_at.and_then(|a| a.get_f64(3)).unwrap_or(0.0);
 
-    let pads: Vec<serde_json::Value> = fp_node
-        .find_all("pad")
-        .iter()
-        .filter_map(|pad| {
-            let number = pad.get(1)?.as_str()?.to_string();
-            let pad_at = pad.find("at")?;
-            let local_x = pad_at.get_f64(1)?;
-            let local_y = pad_at.get_f64(2)?;
-            // Transform local pad coords to board space (rotation only).
-            // Uses the canonical KiCAD transform — see konnect_sexp::geometry.
-            let (board_x, board_y) =
-                konnect_sexp::geometry::transform_pad(local_x, local_y, fp_x, fp_y, fp_rot);
-            // Three outcomes, deliberately distinguishable. No (net …) node at
-            // all is an unconnected pad, and "" says so. A node we can read
-            // gives its name. A node that is present but unreadable gives
-            // null — previously it gave "" too, so a fully connected KiCad 10
-            // pad was indistinguishable from an unconnected one. See
-            // konnect_sexp::net for the two shapes.
-            let net = match pad.find("net") {
-                None => json!(""),
-                Some(node) => match konnect_sexp::net::net_name(node) {
-                    Some(name) => json!(name),
-                    None => serde_json::Value::Null,
-                },
-            };
-            let layers: Vec<_> = pad
-                .find("layers")
-                .and_then(konnect_sexp::SexpNode::children)
-                .unwrap_or_default()
-                .iter()
-                .skip(1)
-                .filter_map(konnect_sexp::SexpNode::as_str)
-                .collect();
-            Some(json!({
-                "number": number,
-                "x": board_x,
-                "y": board_y,
-                "net": net,
-                "layers": layers
-            }))
-        })
-        .collect();
+    let mut pads = Vec::new();
+    for pad in fp_node.find_all("pad") {
+        let pad_number = pad
+            .get(1)
+            .and_then(konnect_sexp::SexpNode::as_str)
+            .unwrap_or("<unreadable>");
+        let Some(pad_at) = pad.find("at") else {
+            return Ok(CallToolResult::error(format!(
+                "Pad '{pad_number}' on footprint '{reference}' has no readable position"
+            )));
+        };
+        let (Some(local_x), Some(local_y)) = (pad_at.get_f64(1), pad_at.get_f64(2)) else {
+            return Ok(CallToolResult::error(format!(
+                "Pad '{pad_number}' on footprint '{reference}' has an invalid position"
+            )));
+        };
+        // Transform local pad coords to board space (rotation only).
+        // Uses the canonical KiCAD transform — see konnect_sexp::geometry.
+        let (board_x, board_y) =
+            konnect_sexp::geometry::transform_pad(local_x, local_y, fp_x, fp_y, fp_rot);
+        // Three outcomes, deliberately distinguishable. No (net …) node at
+        // all is an unconnected pad, and "" says so. A node we can read
+        // gives its name. A node that is present but unreadable gives
+        // null — previously it gave "" too, so a fully connected KiCad 10
+        // pad was indistinguishable from an unconnected one. See
+        // konnect_sexp::net for the two shapes.
+        let net = match pad.find("net") {
+            None => json!(""),
+            Some(node) => match konnect_sexp::net::net_name(node) {
+                Some(name) => json!(name),
+                None => serde_json::Value::Null,
+            },
+        };
+        // In a saved board KiCad writes the pad's effective board-space
+        // angle here. Unlike a library footprint, adding the footprint
+        // angle again would double-rotate the reported geometry.
+        let rotation_deg = pad_at.get_f64(3).unwrap_or(0.0);
+        let pad_info = match pad_info_from_sexp(
+            pad,
+            board_x,
+            board_y,
+            rotation_deg,
+            net.as_str().unwrap_or_default().to_string(),
+        ) {
+            Ok(info) => info,
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "Could not read pad '{pad_number}' on footprint '{reference}': {error}"
+                )))
+            }
+        };
+        let mut value = serde_json::to_value(pad_info)?;
+        // Preserve the established three-state net contract.  The shared
+        // typed pad uses a string for known/unconnected values; malformed
+        // saved net nodes remain an explicit JSON null here.
+        value["net"] = net;
+        pads.push(value);
+    }
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,
@@ -5717,16 +5850,22 @@ mod tests {
     const SAVED_BOARD_WITH_R1: &str = "(kicad_pcb\n\
         \t(version 20260206)\n\
         \t(footprint \"R_0805\"\n\
-        \t\t(at 5 5 0)\n\
+        \t\t(at 5 5 90)\n\
         \t\t(property \"Reference\" \"R1\" (at 0 -1 0) (layer \"F.SilkS\"))\n\
-        \t\t(pad \"1\" smd roundrect (at -0.9 0) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (net \"SAVED\"))\n\
+        \t\t(pad \"1\" smd roundrect (at -0.9 0 105) (size 2.432 1.524)\n\
+        \t\t\t(roundrect_rratio 0.25) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\")\n\
+        \t\t\t(net \"SAVED\") (uuid \"11111111-1111-1111-1111-111111111111\"))\n\
         \t)\n\
         )\n";
 
     fn live_pad(number: &str, x: f64, y: f64, net: &str) -> prost_types::Any {
         konnect_ipc::builders::pack_any(
             &konnect_ipc::gen::kiapi::board::types::Pad {
+                id: Some(konnect_ipc::gen::kiapi::common::types::Kiid {
+                    value: "22222222-2222-2222-2222-222222222222".to_string(),
+                }),
                 number: number.to_string(),
+                r#type: konnect_ipc::gen::kiapi::board::types::PadType::PtSmd as i32,
                 position: Some(konnect_ipc::builders::vec2(x, y)),
                 net: Some(konnect_ipc::gen::kiapi::board::types::Net {
                     code: None,
@@ -5738,6 +5877,78 @@ mod tests {
                         konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFPaste as i32,
                         konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFMask as i32,
                     ],
+                    copper_layers: vec![konnect_ipc::gen::kiapi::board::types::PadStackLayer {
+                        layer: konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFCu as i32,
+                        shape: konnect_ipc::gen::kiapi::board::types::PadStackShape::PssRoundrect
+                            as i32,
+                        size: Some(konnect_ipc::builders::vec2(2.432, 1.524)),
+                        corner_rounding_ratio: 0.25,
+                        ..Default::default()
+                    }],
+                    angle: Some(konnect_ipc::gen::kiapi::common::types::Angle {
+                        value_degrees: 105.0,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.Pad",
+        )
+    }
+
+    fn live_custom_stack_pad(number: &str, x: f64, y: f64) -> prost_types::Any {
+        use konnect_ipc::gen::kiapi::board::types::{
+            BoardLayer, DrillProperties, DrillShape, Pad, PadStack, PadStackLayer, PadStackShape,
+            PadType,
+        };
+
+        let layer = |layer, shape, width, height| PadStackLayer {
+            layer,
+            shape,
+            size: Some(konnect_ipc::builders::vec2(width, height)),
+            ..Default::default()
+        };
+        konnect_ipc::builders::pack_any(
+            &Pad {
+                number: number.to_string(),
+                r#type: PadType::PtPth as i32,
+                position: Some(konnect_ipc::builders::vec2(x, y)),
+                pad_stack: Some(PadStack {
+                    layers: vec![
+                        BoardLayer::BlFCu as i32,
+                        BoardLayer::BlIn1Cu as i32,
+                        BoardLayer::BlBCu as i32,
+                    ],
+                    copper_layers: vec![
+                        layer(
+                            BoardLayer::BlFCu as i32,
+                            PadStackShape::PssCustom as i32,
+                            3.0,
+                            2.0,
+                        ),
+                        layer(
+                            BoardLayer::BlIn1Cu as i32,
+                            PadStackShape::PssCircle as i32,
+                            1.5,
+                            1.5,
+                        ),
+                        layer(
+                            BoardLayer::BlBCu as i32,
+                            PadStackShape::PssRectangle as i32,
+                            2.0,
+                            1.0,
+                        ),
+                    ],
+                    drill: Some(DrillProperties {
+                        start_layer: BoardLayer::BlFCu as i32,
+                        end_layer: BoardLayer::BlBCu as i32,
+                        diameter: Some(konnect_ipc::builders::vec2(0.8, 1.2)),
+                        shape: DrillShape::DsOblong as i32,
+                        ..Default::default()
+                    }),
+                    angle: Some(konnect_ipc::gen::kiapi::common::types::Angle {
+                        value_degrees: 37.0,
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -5866,6 +6077,15 @@ mod tests {
         assert_eq!(body["pads"][0]["net"], json!("/VBUS"));
         assert_eq!(body["pads"][0]["x"], json!(101.155));
         assert_eq!(
+            body["pads"][0]["uuid"],
+            "22222222-2222-2222-2222-222222222222"
+        );
+        assert_eq!(body["pads"][0]["pad_type"], "smd");
+        assert_eq!(body["pads"][0]["shape"], "roundrect");
+        assert_eq!(body["pads"][0]["size"], json!({"x": 2.432, "y": 1.524}));
+        assert_eq!(body["pads"][0]["rotation_deg"], 105.0);
+        assert_eq!(body["pads"][0]["copper_layers"][0]["layer"], "F.Cu");
+        assert_eq!(
             body["pads"][0]["layers"],
             json!(["F.Cu", "F.Paste", "F.Mask"])
         );
@@ -5948,9 +6168,173 @@ mod tests {
         assert_eq!(body["source"], json!("file"));
         assert_eq!(body["pads"][0]["net"], json!("SAVED"));
         assert_eq!(
+            body["pads"][0]["uuid"],
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(body["pads"][0]["pad_type"], "smd");
+        assert_eq!(body["pads"][0]["shape"], "roundrect");
+        assert_eq!(body["pads"][0]["size"], json!({"x": 2.432, "y": 1.524}));
+        assert_eq!(body["pads"][0]["rotation_deg"], 105.0);
+        assert_eq!(body["pads"][0]["copper_layers"][0]["layer"], "F.Cu");
+        assert_eq!(
             body["pads"][0]["layers"],
             json!(["F.Cu", "F.Paste", "F.Mask"])
         );
+    }
+
+    #[tokio::test]
+    async fn live_and_file_pad_geometry_use_the_same_response_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let server = spawn_kicad_holding(
+            &board,
+            vec![live_footprint("R1", vec![live_pad("1", 5.0, 5.9, "SAVED")])],
+        );
+        let args = json!({ "board": board.to_string_lossy(), "reference": "R1" });
+
+        let live = handle_get_component_pads(&args, &ctx_talking_to(server.address().to_string()))
+            .await
+            .unwrap();
+        let file = handle_get_component_pads(&args, &test_ctx()).await.unwrap();
+        let live = parsed(&live);
+        let file = parsed(&file);
+        let live_keys: std::collections::BTreeSet<_> = live["pads"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let file_keys: std::collections::BTreeSet<_> = file["pads"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+
+        assert_eq!(live_keys, file_keys);
+    }
+
+    #[tokio::test]
+    async fn live_custom_front_inner_back_stack_keeps_each_copper_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let server = spawn_kicad_holding(
+            &board,
+            vec![live_footprint(
+                "R1",
+                vec![live_custom_stack_pad("1", 12.0, 34.0)],
+            )],
+        );
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = parsed(&result);
+        assert_eq!(body["pads"][0]["shape"], "custom");
+        assert_eq!(body["pads"][0]["rotation_deg"], 37.0);
+        assert_eq!(body["pads"][0]["drill"]["shape"], "oval");
+        assert_eq!(
+            body["pads"][0]["copper_layers"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(body["pads"][0]["copper_layers"][0]["layer"], "F.Cu");
+        assert_eq!(body["pads"][0]["copper_layers"][0]["shape"], "custom");
+        assert_eq!(body["pads"][0]["copper_layers"][1]["layer"], "In1.Cu");
+        assert_eq!(body["pads"][0]["copper_layers"][1]["shape"], "circle");
+        assert_eq!(body["pads"][0]["copper_layers"][2]["layer"], "B.Cu");
+        assert_eq!(body["pads"][0]["copper_layers"][2]["shape"], "rect");
+    }
+
+    #[tokio::test]
+    async fn saved_back_side_footprint_keeps_board_space_rotation_and_back_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("back.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\
+             \t(footprint \"BackSide\"\n\
+             \t\t(layer \"B.Cu\")\n\
+             \t\t(at 20 30 45)\n\
+             \t\t(property \"Reference\" \"U1\")\n\
+             \t\t(pad \"1\" smd oval (at 2 -1 225) (size 2 1)\n\
+             \t\t\t(layers \"B.Cu\" \"B.Paste\" \"B.Mask\"))\n\
+             \t)\n\
+             )\n",
+        )
+        .unwrap();
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "U1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = parsed(&result);
+        assert_eq!(body["pads"][0]["rotation_deg"], 225.0);
+        assert_eq!(body["pads"][0]["shape"], "oval");
+        assert_eq!(
+            body["pads"][0]["layers"],
+            json!(["B.Cu", "B.Paste", "B.Mask"])
+        );
+        assert_eq!(body["pads"][0]["copper_layers"][0]["layer"], "B.Cu");
+    }
+
+    #[tokio::test]
+    async fn kicad_authored_board_reports_the_saved_effective_pad_rotation() {
+        let board =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drc_ownership_j1.kicad_pcb");
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "J1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = parsed(&result);
+        assert_eq!(body["source"], "file");
+        assert_eq!(body["pad_count"], 4);
+        assert_eq!(body["pads"][0]["shape"], "rect");
+        assert_eq!(body["pads"][0]["size"], json!({"x": 1.78, "y": 1.02}));
+        assert_eq!(body["pads"][0]["rotation_deg"], 90.0);
+        assert_eq!(body["pads"][0]["net"], "GND");
+    }
+
+    #[tokio::test]
+    async fn file_pad_reads_refuse_to_silently_drop_an_unreadable_pad() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\
+             \t(footprint \"Malformed\"\n\
+             \t\t(at 5 5 0)\n\
+             \t\t(property \"Reference\" \"R1\")\n\
+             \t\t(pad \"1\" smd rect (size 1 1) (layers \"F.Cu\"))\n\
+             \t)\n\
+             )\n",
+        )
+        .unwrap();
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("Pad '1' on footprint 'R1' has no readable position"));
     }
 
     #[tokio::test]

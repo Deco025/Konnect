@@ -173,6 +173,12 @@ board open live (fanout apply is the inverse: it REQUIRES the live board).
 
 ## Routing
 
+Before choosing trace approach points, call `get_component_pads` for the
+participating footprints. Use its returned board-space position, effective
+rotation, shape, size, drill, and per-copper-layer geometry; do not estimate
+copper extent from package family or a different pad in the footprint. A null
+geometry field is unavailable evidence, not a zero-size pad.
+
 ### Routing Tools
 
 | Tool                      | Use Case                                    |

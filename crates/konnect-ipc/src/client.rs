@@ -22,6 +22,93 @@ fn nm_to_mm(nm: i64) -> f64 {
     nm as f64 / 1_000_000.0
 }
 
+fn pad_type_name(value: i32) -> Option<String> {
+    use kiapi::board::types::PadType;
+    match PadType::try_from(value).ok()? {
+        PadType::PtPth => Some("thru_hole".to_string()),
+        PadType::PtSmd => Some("smd".to_string()),
+        PadType::PtEdgeConnector => Some("edge_connector".to_string()),
+        PadType::PtNpth => Some("np_thru_hole".to_string()),
+        PadType::PtUnknown => None,
+    }
+}
+
+fn pad_shape_name(value: i32) -> Option<String> {
+    use kiapi::board::types::PadStackShape;
+    match PadStackShape::try_from(value).ok()? {
+        PadStackShape::PssCircle => Some("circle".to_string()),
+        PadStackShape::PssRectangle => Some("rect".to_string()),
+        PadStackShape::PssOval => Some("oval".to_string()),
+        PadStackShape::PssTrapezoid => Some("trapezoid".to_string()),
+        PadStackShape::PssRoundrect => Some("roundrect".to_string()),
+        PadStackShape::PssChamferedrect => Some("chamfered_rect".to_string()),
+        PadStackShape::PssCustom => Some("custom".to_string()),
+        PadStackShape::PssUnknown => None,
+    }
+}
+
+fn drill_shape_name(value: i32) -> Option<String> {
+    use kiapi::board::types::DrillShape;
+    match DrillShape::try_from(value).ok()? {
+        DrillShape::DsCircle => Some("circle".to_string()),
+        DrillShape::DsOblong => Some("oval".to_string()),
+        DrillShape::DsUndefined | DrillShape::DsUnknown => None,
+    }
+}
+
+fn optional_point_in_mm(point: Option<kiapi::common::types::Vector2>) -> Option<IpcVector2> {
+    point.map(point_in_mm)
+}
+
+struct PadGeometry {
+    rotation_deg: Option<f64>,
+    shape: Option<String>,
+    size: Option<IpcVector2>,
+    drill: Option<IpcPadDrill>,
+    copper_layers: Vec<IpcPadLayerGeometry>,
+}
+
+fn pad_geometry(pad: &kiapi::board::types::Pad) -> PadGeometry {
+    let Some(stack) = pad.pad_stack.as_ref() else {
+        return PadGeometry {
+            rotation_deg: None,
+            shape: None,
+            size: None,
+            drill: None,
+            copper_layers: Vec::new(),
+        };
+    };
+    let copper_layers: Vec<_> = stack
+        .copper_layers
+        .iter()
+        .map(|layer| IpcPadLayerGeometry {
+            layer: layer_enum_to_name(layer.layer).to_string(),
+            shape: pad_shape_name(layer.shape),
+            size: optional_point_in_mm(layer.size),
+            offset: optional_point_in_mm(layer.offset),
+            corner_rounding_ratio: (layer.corner_rounding_ratio != 0.0)
+                .then_some(layer.corner_rounding_ratio),
+            chamfer_ratio: (layer.chamfer_ratio != 0.0).then_some(layer.chamfer_ratio),
+        })
+        .collect();
+    let shape = copper_layers.first().and_then(|layer| layer.shape.clone());
+    let size = copper_layers.first().and_then(|layer| layer.size.clone());
+    let drill = stack.drill.as_ref().map(|drill| IpcPadDrill {
+        shape: drill_shape_name(drill.shape),
+        size: optional_point_in_mm(drill.diameter),
+        start_layer: (drill.start_layer != 0)
+            .then(|| layer_enum_to_name(drill.start_layer).to_string()),
+        end_layer: (drill.end_layer != 0).then(|| layer_enum_to_name(drill.end_layer).to_string()),
+    });
+    PadGeometry {
+        rotation_deg: stack.angle.as_ref().map(|angle| angle.value_degrees),
+        shape,
+        size,
+        drill,
+        copper_layers,
+    }
+}
+
 /// Map a BoardLayer enum integer back to a KiCAD layer name string.
 fn layer_enum_to_name(layer: i32) -> &'static str {
     kiapi::board::types::BoardLayer::try_from(layer)
@@ -2063,12 +2150,21 @@ impl KiCadIpcClient {
                             .collect()
                     })
                     .unwrap_or_default();
+                let geometry = pad_geometry(&pad);
+                let uuid = kiid_value(pad.id.clone());
                 pads.push(IpcPad {
+                    uuid: (!uuid.is_empty()).then_some(uuid),
                     number: pad.number,
                     x: nm_to_mm(position.x_nm),
                     y: nm_to_mm(position.y_nm),
                     net: pad.net.map(|net| net.name).unwrap_or_default(),
                     layers,
+                    pad_type: pad_type_name(pad.r#type),
+                    rotation_deg: geometry.rotation_deg,
+                    shape: geometry.shape,
+                    size: geometry.size,
+                    drill: geometry.drill,
+                    copper_layers: geometry.copper_layers,
                 });
             }
             found = Some(pads);

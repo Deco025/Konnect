@@ -243,10 +243,36 @@ impl std::fmt::Display for IpcSelectionObservationError {
 
 impl std::error::Error for IpcSelectionObservationError {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcVector2 {
     pub x: f64,
     pub y: f64,
+}
+
+/// One copper-layer shape from a KiCad pad stack.
+///
+/// `layer` is the native KiCad layer name.  A normal stack may expose one
+/// representative copper entry while `IpcPad::layers` still names every layer
+/// on which the pad exists. Front/inner/back stacks retain every distinct
+/// entry here; custom shapes are identified as `custom` rather than reduced to
+/// a guessed ordinary outline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcPadLayerGeometry {
+    pub layer: String,
+    pub shape: Option<String>,
+    pub size: Option<IpcVector2>,
+    pub offset: Option<IpcVector2>,
+    pub corner_rounding_ratio: Option<f64>,
+    pub chamfer_ratio: Option<f64>,
+}
+
+/// Native drill information for a pad, when it has a drilled hole.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcPadDrill {
+    pub shape: Option<String>,
+    pub size: Option<IpcVector2>,
+    pub start_layer: Option<String>,
+    pub end_layer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +292,9 @@ pub struct IpcFootprint {
 /// so no anchor or rotation transform is applied on the way out.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcPad {
+    /// Stable KiCad item identifier, or `None` when the source did not carry
+    /// one.  Never synthesize an identifier for a pad that KiCad did not name.
+    pub uuid: Option<String>,
     pub number: String,
     pub x: f64,
     pub y: f64,
@@ -273,6 +302,20 @@ pub struct IpcPad {
     pub net: String,
     /// KiCad layer names from the live pad stack.
     pub layers: Vec<String>,
+    /// Native KiCad pad type (`smd`, `thru_hole`, `np_thru_hole`, or
+    /// `edge_connector`), or `None` for an unknown future type.
+    pub pad_type: Option<String>,
+    /// Effective pad-stack rotation in board space, in degrees.
+    pub rotation_deg: Option<f64>,
+    /// Compact geometry for ordinary pads.  These mirror the first copper
+    /// entry; callers needing custom/front-inner-back detail use
+    /// `copper_layers` instead.
+    pub shape: Option<String>,
+    pub size: Option<IpcVector2>,
+    pub drill: Option<IpcPadDrill>,
+    /// Every copper geometry entry KiCad supplied.  This prevents custom and
+    /// front/inner/back pad stacks from being flattened into a guessed shape.
+    pub copper_layers: Vec<IpcPadLayerGeometry>,
 }
 
 /// The document's title block, which the board file also carries.

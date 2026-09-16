@@ -155,8 +155,9 @@ Acceptance procedure:
 1. Create or select the exact symbol and footprint only after completing the
    source columns above.
 2. Query the symbol back with `get_symbol_info` and the footprint with
-   `get_footprint_info`. Compare every returned pin/pad number, name, type,
-   coordinate, drill, size, and layer set to the table and datasheet.
+   `get_footprint_info(include_pads=true)`. The returned pad coordinates and
+   rotations are footprint-local. Compare every returned pin/pad number, name,
+   type, coordinate, drill, size, and layer set to the table and datasheet.
 3. Place a **disposable** symbol and footprint in a scratch project. Render the
    schematic and board, then inspect the pin-1/key marker, numbering direction,
    top/bottom orientation, pad geometry, drill/slot geometry, courtyard, fab,
