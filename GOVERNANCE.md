@@ -45,7 +45,12 @@ independent.
 - A write collaborator cannot bypass the ruleset. Any owner-only direct-push
   exception is reserved for the documented release recipe's bump/stamp commits;
   it is not an ordinary merge shortcut.
-- **Run the full local gate after each merge** before landing the next one:
+- **Do not repeat the full local gate after every merge.** The required checks
+  on the reviewed exact head are the merge evidence when the merge commit
+  contains only that head plus the reviewed base. Run the full local gate only
+  when the merged result differs from that composition, required evidence was
+  unavailable or incomplete, or a concrete post-merge symptom creates a
+  specific reason to retest:
 
   ```
   cargo fmt --all -- --check
@@ -54,8 +59,9 @@ independent.
   cargo test --workspace --locked --doc
   ```
 
-  Capture the exit code directly. Piping into `tail` or `echo` swallows it, and
-  that has put a red commit on `main` twice.
+  When the conditional gate is required, capture each exit code directly.
+  Piping into `tail` or `echo` swallows it, and that has put a red commit on
+  `main` twice.
 - **CODEOWNERS is a routing hint, not a veto.** It auto-requests the right
   reviewer; it does not block a merge.
 
@@ -74,10 +80,11 @@ independent.
    the appropriate state, review the new exact head, and arm it again only after
    the gate is restored. GitHub may automatically disable auto-merge after a
    fork contributor pushes; that is expected safety behavior.
-5. After merge, synchronize local `main`, run the complete local gate below,
-   verify terminal issue closure and post the acceptance evidence, then promote
-   only the next PR in the documented dependency order. GitHub deletes the
-   merged topic branch automatically.
+5. After merge, synchronize local `main`, verify the merge commit, terminal
+   issue closure, and acceptance evidence, then promote only the next PR in the
+   documented dependency order. Run the complete local gate above only when
+   one of its explicit conditions applies. GitHub deletes the merged topic
+   branch automatically.
 
 ## Claiming work
 
@@ -148,8 +155,9 @@ Within an overlap set the order is not arbitrary:
 6. **Release, version and count changes land last** — never through the middle
    of an active queue. v0.10.0 ignored this and invalidated eleven open PRs in
    one push. This rule exists because of that, not in anticipation of it.
-7. After each merge: update `main`, run the full gate, promote the next PR,
-   and arm auto-merge only once the exact head has been reviewed.
+7. After each merge: update `main`, verify the merge and issue state, run the
+   full local gate only when its documented conditions apply, promote the next
+   PR, and arm auto-merge only once the exact head has been reviewed.
 
 ## Releases
 
