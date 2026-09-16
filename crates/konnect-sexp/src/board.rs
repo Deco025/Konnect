@@ -355,19 +355,29 @@ pub fn lossless_zone_outlines(tree: &SexpNode) -> Scan<LosslessZoneOutline> {
 
 /// Bounding box `(min_x, min_y, max_x, max_y)` of the board outline: every
 /// `Edge.Cuts` graphic that is a direct child of `(kicad_pcb …)` — `gr_line`,
-/// `gr_rect`, `gr_arc`, `gr_circle`, `gr_curve`.
+/// `gr_rect`, `gr_arc`, `gr_circle`, `gr_curve`, `gr_poly`.
 ///
 /// Arcs use exact extrema ([`crate::geometry::arc_bbox`]): a board whose
 /// outline bulges through a fillet or a semicircular edge is wider than its
 /// endpoints say. Bézier `gr_curve`s use the control-point hull, which is a
-/// (tight enough) superset of the curve.
+/// (tight enough) superset of the curve. `gr_poly` outlines — KiCad's native
+/// way to draw a non-rectangular or concave board edge — use the same
+/// vertex-hull bbox, but it is exact rather than a superset: polygon edges
+/// are straight, so the vertices *are* the extrema.
 ///
 /// All-or-nothing: `None` when there are no Edge.Cuts graphics **or when any
 /// of them is malformed**. A partial outline bbox looks exactly like a
 /// finished one and silently mis-sizes the board, so a single broken edge
 /// graphic invalidates the answer rather than shrinking it.
 pub fn board_outline_bbox(tree: &SexpNode) -> Option<(f64, f64, f64, f64)> {
-    const EDGE_TAGS: [&str; 5] = ["gr_line", "gr_rect", "gr_arc", "gr_circle", "gr_curve"];
+    const EDGE_TAGS: [&str; 6] = [
+        "gr_line",
+        "gr_rect",
+        "gr_arc",
+        "gr_circle",
+        "gr_curve",
+        "gr_poly",
+    ];
     let mut acc: Option<(f64, f64, f64, f64)> = None;
     for child in tree.children().unwrap_or(&[]) {
         let Some(head) = child.head() else { continue };
@@ -404,25 +414,31 @@ fn graphic_bbox(node: &SexpNode, head: &str) -> Option<(f64, f64, f64, f64)> {
             let r = (ex - cx).hypot(ey - cy);
             Some((cx - r, cy - r, cx + r, cy + r))
         }
-        "gr_curve" => {
-            // Cubic Bézier: the control polygon contains the curve, so its
-            // hull is a valid (if slightly loose) bbox.
-            let pts = node.find("pts")?;
-            let mut acc: Option<(f64, f64, f64, f64)> = None;
-            for xy in pts.find_all("xy") {
-                let (x, y) = (xy.get_f64(1)?, xy.get_f64(2)?);
-                if !x.is_finite() || !y.is_finite() {
-                    return None;
-                }
-                acc = Some(match acc {
-                    None => (x, y, x, y),
-                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-                });
-            }
-            acc
-        }
+        // Cubic Bézier: the control polygon contains the curve, so its hull
+        // is a valid (if slightly loose) bbox.
+        //
+        // gr_poly: a straight-edged polygon, so the same vertex-hull bbox is
+        // exact rather than a superset.
+        "gr_curve" | "gr_poly" => pts_bbox(node),
         _ => None,
     }
+}
+
+/// Bbox of every `(xy x y)` vertex under a node's `pts` child.
+fn pts_bbox(node: &SexpNode) -> Option<(f64, f64, f64, f64)> {
+    let pts = node.find("pts")?;
+    let mut acc: Option<(f64, f64, f64, f64)> = None;
+    for xy in pts.find_all("xy") {
+        let (x, y) = (xy.get_f64(1)?, xy.get_f64(2)?);
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        acc = Some(match acc {
+            None => (x, y, x, y),
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+        });
+    }
+    acc
 }
 
 /// `(tag x y)` as a finite coordinate pair, or `None` — never a zero-filled

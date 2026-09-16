@@ -1857,6 +1857,41 @@ mod tests {
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
     }
 
+    /// KiCad-authored fixture (#593, see
+    /// `konnect-sexp/tests/fixtures/gr_poly_outline.README.md`): a single
+    /// 12-vertex, non-rectangular `gr_poly` Edge.Cuts outline, copied from a
+    /// real project board into a fresh board and saved by pcbnew — not
+    /// manufactured by string surgery. It has no footprints, so this exercises
+    /// `score_placement`'s public path purely for outline recognition: the
+    /// board must not be treated as outline-missing, and its verdict must be
+    /// able to reach "pass" (blocked only by outline absence or hard
+    /// failures, of which an empty board has none).
+    const GR_POLY_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../konnect-sexp/tests/fixtures/gr_poly_outline.kicad_pcb"
+    );
+
+    #[tokio::test]
+    async fn gr_poly_outline_is_recognized_through_the_public_scoring_path() {
+        let response = score(std::path::Path::new(GR_POLY_FIXTURE)).await;
+
+        assert_eq!(response["outline_missing"], false, "{response}");
+        assert_eq!(response["verdict"], "pass", "{response}");
+        assert_eq!(response["score"], 100);
+        assert_eq!(response["footprints_scored"], 0);
+        assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
+        assert_eq!(response["connector_edges"].as_array().unwrap().len(), 0);
+
+        // Cross-check against konnect-sexp's own bbox for the same file
+        // (hand-computed in the fixture's README from its 12 `xy` vertices).
+        let content = std::fs::read_to_string(GR_POLY_FIXTURE).unwrap();
+        let tree = konnect_sexp::parse_sexp(&content).unwrap();
+        assert_eq!(
+            board_outline_bbox(&tree),
+            Some((103.42, 78.96, 154.48, 116.96))
+        );
+    }
+
     /// Move ONE footprint's root anchor by string surgery on the
     /// KiCad-authored fixture, the way
     /// `overlapping_courtyards_are_a_hard_fail_naming_the_pair` does: the
