@@ -5896,6 +5896,67 @@ mod tests {
         )
     }
 
+    fn live_custom_stack_pad(number: &str, x: f64, y: f64) -> prost_types::Any {
+        use konnect_ipc::gen::kiapi::board::types::{
+            BoardLayer, DrillProperties, DrillShape, Pad, PadStack, PadStackLayer, PadStackShape,
+            PadType,
+        };
+
+        let layer = |layer, shape, width, height| PadStackLayer {
+            layer,
+            shape,
+            size: Some(konnect_ipc::builders::vec2(width, height)),
+            ..Default::default()
+        };
+        konnect_ipc::builders::pack_any(
+            &Pad {
+                number: number.to_string(),
+                r#type: PadType::PtPth as i32,
+                position: Some(konnect_ipc::builders::vec2(x, y)),
+                pad_stack: Some(PadStack {
+                    layers: vec![
+                        BoardLayer::BlFCu as i32,
+                        BoardLayer::BlIn1Cu as i32,
+                        BoardLayer::BlBCu as i32,
+                    ],
+                    copper_layers: vec![
+                        layer(
+                            BoardLayer::BlFCu as i32,
+                            PadStackShape::PssCustom as i32,
+                            3.0,
+                            2.0,
+                        ),
+                        layer(
+                            BoardLayer::BlIn1Cu as i32,
+                            PadStackShape::PssCircle as i32,
+                            1.5,
+                            1.5,
+                        ),
+                        layer(
+                            BoardLayer::BlBCu as i32,
+                            PadStackShape::PssRectangle as i32,
+                            2.0,
+                            1.0,
+                        ),
+                    ],
+                    drill: Some(DrillProperties {
+                        start_layer: BoardLayer::BlFCu as i32,
+                        end_layer: BoardLayer::BlBCu as i32,
+                        diameter: Some(konnect_ipc::builders::vec2(0.8, 1.2)),
+                        shape: DrillShape::DsOblong as i32,
+                        ..Default::default()
+                    }),
+                    angle: Some(konnect_ipc::gen::kiapi::common::types::Angle {
+                        value_degrees: 37.0,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.Pad",
+        )
+    }
+
     fn live_footprint(reference: &str, pads: Vec<prost_types::Any>) -> prost_types::Any {
         use konnect_ipc::gen::kiapi;
         konnect_ipc::builders::pack_any(
@@ -6152,6 +6213,79 @@ mod tests {
             .collect();
 
         assert_eq!(live_keys, file_keys);
+    }
+
+    #[tokio::test]
+    async fn live_custom_front_inner_back_stack_keeps_each_copper_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let server = spawn_kicad_holding(
+            &board,
+            vec![live_footprint(
+                "R1",
+                vec![live_custom_stack_pad("1", 12.0, 34.0)],
+            )],
+        );
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = parsed(&result);
+        assert_eq!(body["pads"][0]["shape"], "custom");
+        assert_eq!(body["pads"][0]["rotation_deg"], 37.0);
+        assert_eq!(body["pads"][0]["drill"]["shape"], "oval");
+        assert_eq!(
+            body["pads"][0]["copper_layers"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(body["pads"][0]["copper_layers"][0]["layer"], "F.Cu");
+        assert_eq!(body["pads"][0]["copper_layers"][0]["shape"], "custom");
+        assert_eq!(body["pads"][0]["copper_layers"][1]["layer"], "In1.Cu");
+        assert_eq!(body["pads"][0]["copper_layers"][1]["shape"], "circle");
+        assert_eq!(body["pads"][0]["copper_layers"][2]["layer"], "B.Cu");
+        assert_eq!(body["pads"][0]["copper_layers"][2]["shape"], "rect");
+    }
+
+    #[tokio::test]
+    async fn saved_back_side_footprint_keeps_board_space_rotation_and_back_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("back.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\
+             \t(footprint \"BackSide\"\n\
+             \t\t(layer \"B.Cu\")\n\
+             \t\t(at 20 30 45)\n\
+             \t\t(property \"Reference\" \"U1\")\n\
+             \t\t(pad \"1\" smd oval (at 2 -1 225) (size 2 1)\n\
+             \t\t\t(layers \"B.Cu\" \"B.Paste\" \"B.Mask\"))\n\
+             \t)\n\
+             )\n",
+        )
+        .unwrap();
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "U1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = parsed(&result);
+        assert_eq!(body["pads"][0]["rotation_deg"], 225.0);
+        assert_eq!(body["pads"][0]["shape"], "oval");
+        assert_eq!(
+            body["pads"][0]["layers"],
+            json!(["B.Cu", "B.Paste", "B.Mask"])
+        );
+        assert_eq!(body["pads"][0]["copper_layers"][0]["layer"], "B.Cu");
     }
 
     #[tokio::test]
