@@ -204,4 +204,4 @@ integration branch, child PRs use `Part of`; the terminal PR to `main` carries
 the closing references and the acceptance evidence.
 
 See [GOVERNANCE.md](../GOVERNANCE.md) for claiming, merge authority, required
-checks, and post-merge validation.
+checks, and the conditions that require post-merge local validation.
