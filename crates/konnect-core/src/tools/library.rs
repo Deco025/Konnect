@@ -380,6 +380,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" },
                     "project": { "type": "string", "description": "Path to a .kicad_pro used to resolve project libraries (optional)" },
+                    "include_pads": { "type": "boolean", "description": "Include typed pad geometry in footprint-local coordinates", "default": false },
                     "include_graphics": { "type": "boolean", "description": "Include supported top-level footprint graphics in the response", "default": false },
                     "graphics_layer": { "type": "string", "description": "Return graphics only from this canonical KiCad layer; implies include_graphics" }
                 },
@@ -4548,6 +4549,48 @@ async fn handle_get_footprint_info(
         "has_3d_model": has_3d,
         "path": path.to_str().unwrap_or("")
     });
+    if args["include_pads"].as_bool().unwrap_or(false) {
+        let mut pads = Vec::with_capacity(pad_count);
+        for pad in footprint
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|node| node.head() == Some("pad"))
+        {
+            let pad_number = pad
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .unwrap_or("<unreadable>");
+            let Some(at) = pad.find("at") else {
+                return Ok(CallToolResult::error(format!(
+                    "Pad '{pad_number}' has no readable footprint-local position"
+                )));
+            };
+            let (Some(x), Some(y)) = (at.get_f64(1), at.get_f64(2)) else {
+                return Ok(CallToolResult::error(format!(
+                    "Pad '{pad_number}' has an invalid footprint-local position"
+                )));
+            };
+            let rotation_deg = at.get_f64(3).unwrap_or(0.0);
+            let info = match super::pcb_components::pad_info_from_sexp(
+                pad,
+                x,
+                y,
+                rotation_deg,
+                String::new(),
+            ) {
+                Ok(info) => info,
+                Err(error) => {
+                    return Ok(CallToolResult::error(format!(
+                        "Could not read pad '{pad_number}': {error}"
+                    )))
+                }
+            };
+            pads.push(info);
+        }
+        response["coordinate_space"] = json!("footprint_local");
+        response["pads"] = serde_json::to_value(pads)?;
+    }
     let graphics_layer = args["graphics_layer"].as_str();
     let include_graphics =
         args["include_graphics"].as_bool().unwrap_or(false) || graphics_layer.is_some();
@@ -6442,10 +6485,12 @@ mod tests {
             "default response must stay compact: {default}"
         );
         assert!(default.get("graphic_count").is_none());
+        assert!(default.get("pads").is_none());
 
         let detailed = handle_get_footprint_info(
             &json!({
                 "footprint_path": path.to_string_lossy(),
+                "include_pads": true,
                 "include_graphics": true,
                 "graphics_layer": "B.CrtYd"
             }),
@@ -6464,6 +6509,17 @@ mod tests {
         assert_eq!(detailed["graphics"][0]["closed"], true);
         assert_eq!(detailed["graphics"][0]["stroke_width_mm"], 0.05);
         assert_eq!(detailed["graphics"][0]["fill"], "none");
+        assert_eq!(detailed["coordinate_space"], "footprint_local");
+        assert_eq!(detailed["pads"][0]["number"], "1");
+        assert_eq!(detailed["pads"][0]["pad_type"], "thru_hole");
+        assert_eq!(detailed["pads"][0]["shape"], "circle");
+        assert_eq!(detailed["pads"][0]["size"], json!({"x": 1.8, "y": 1.8}));
+        assert_eq!(detailed["pads"][0]["drill"]["shape"], "circle");
+        assert_eq!(
+            detailed["pads"][0]["drill"]["size"],
+            json!({"x": 1.0, "y": 1.0})
+        );
+        assert_eq!(detailed["pads"][0]["copper_layers"][0]["layer"], "*.Cu");
 
         let invalid = handle_get_footprint_info(
             &json!({
@@ -6488,7 +6544,38 @@ mod tests {
             .unwrap()
             .input_schema;
         assert_eq!(schema["properties"]["include_graphics"]["type"], "boolean");
+        assert_eq!(schema["properties"]["include_pads"]["type"], "boolean");
         assert_eq!(schema["properties"]["graphics_layer"]["type"], "string");
+    }
+
+    #[tokio::test]
+    async fn get_footprint_info_refuses_to_silently_drop_an_unreadable_pad() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("malformed-pad.kicad_mod");
+        std::fs::write(
+            &path,
+            r#"(footprint "MalformedPad"
+  (layer "F.Cu")
+  (pad "1" smd rect (size 1 1) (layers "F.Cu"))
+)"#,
+        )
+        .unwrap();
+
+        let result = handle_get_footprint_info(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "include_pads": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("Pad '1' has no readable footprint-local position"));
     }
 
     #[tokio::test]
@@ -6581,7 +6668,10 @@ mod tests {
         std::fs::write(&path, KICAD_STYLE_FOOTPRINT).unwrap();
 
         let result = handle_get_footprint_info(
-            &json!({"footprint_path": path.to_string_lossy()}),
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "include_pads": true
+            }),
             &test_ctx(),
         )
         .await
@@ -6595,6 +6685,20 @@ mod tests {
         assert_eq!(result["pad_count"], 6);
         assert_eq!(result["has_courtyard"], true);
         assert_eq!(result["has_3d_model"], true);
+        assert_eq!(result["coordinate_space"], "footprint_local");
+        assert_eq!(result["pads"].as_array().unwrap().len(), 6);
+        assert_eq!(result["pads"][0]["pad_type"], "np_thru_hole");
+        assert_eq!(result["pads"][0]["number"], "");
+        assert_eq!(result["pads"][0]["drill"]["shape"], "circle");
+        assert_eq!(result["pads"][2]["shape"], "roundrect");
+        assert_eq!(result["pads"][3]["number"], "B12");
+        assert_eq!(result["pads"][4]["number"], "SH");
+        assert_eq!(result["pads"][5]["number"], "SH");
+        assert_eq!(result["pads"][4]["drill"]["shape"], "oval");
+        assert_eq!(
+            result["pads"][4]["drill"]["size"],
+            json!({"x": 0.6, "y": 1.7})
+        );
     }
 
     #[tokio::test]
