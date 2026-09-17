@@ -20,7 +20,40 @@
       "version": "0.12.0",
       "status": "stable",
       "kicad_version": "10.0",
-      "kicad_version_max": "10.99"
+      "kicad_version_max": "10.99",
+      "platforms": [
+        "linux"
+      ],
+      "download_sha256": "85f3a6cff7e3e88b09da877b71f5b59570904efb8e410456d9a5fb6f556f24de",
+      "download_size": 17296331,
+      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.12.0/konnect-pcm-v0.12.0-linux.zip",
+      "install_size": 49812618
+    },
+    {
+      "version": "0.12.0",
+      "status": "stable",
+      "kicad_version": "10.0",
+      "kicad_version_max": "10.99",
+      "platforms": [
+        "macos"
+      ],
+      "download_sha256": "93345bc214f26e1d7c20039da1f7b0af5bda53a5f5117965690d8087275c6ddf",
+      "download_size": 32769200,
+      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.12.0/konnect-pcm-v0.12.0-macos.zip",
+      "install_size": 85540018
+    },
+    {
+      "version": "0.12.0",
+      "status": "stable",
+      "kicad_version": "10.0",
+      "kicad_version_max": "10.99",
+      "platforms": [
+        "windows"
+      ],
+      "download_sha256": "86dc05bee5c700fb303c89a7b7f315a75985c466d4e862a34c261f9d4e925622",
+      "download_size": 15786868,
+      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.12.0/konnect-pcm-v0.12.0-windows.zip",
+      "install_size": 43394666
     }
   ]
 }
