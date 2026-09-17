@@ -216,6 +216,23 @@ are shared project work:
 Validation debt is permission to gather field evidence after a safe merge, not
 permission to represent an unavailable check as passed or to bypass required CI.
 
+## Wontfix review window
+
+`wontfix` is a reviewed disposition, not an immediate silent closure. Applying
+the label to an open issue starts a 30-day evidence window. Automation comments
+with the exact UTC closing date so a reporter or contributor has one final,
+visible opportunity to identify a supported interface, overlooked evidence or
+changed requirement.
+
+- Removing `wontfix` cancels the pending closure.
+- Reapplying it starts a new 30-day window.
+- If the issue remains open and labeled at the deadline, automation records the
+  completed window and closes it as `not planned`.
+- A maintainer may remove the label when new evidence changes the decision; the
+  ordinary triage and architecture-review process then resumes.
+
+The workflow enforces timing only. It never chooses the disposition.
+
 ## Licensing
 
 Konnect is AGPL-3.0 with commercial licences available, so contributions must
