@@ -12,7 +12,7 @@ use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, opt_u32, reembed_lib_symbols,
     require_array, require_f64, require_str,
-    sch_wiring::{carry_no_connects, observed_no_connect_moves},
+    sch_wiring::{carry_no_connects, observed_no_connect_moves, reconcile_junctions_for_placement},
     ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
@@ -3219,12 +3219,8 @@ async fn handle_move_schematic_component(
     };
     let (new_x, new_y) = snap_point(new_x, new_y, 1.27);
 
-    // Pin positions before the move, so the dots the pins vacate can be judged
-    // afterwards (#120). Wires do not change here — pins do.
-    let before_pins = pins_before_placement_change(&sch_path);
-
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    let before_source = sch.to_source();
+    let before_source = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
     let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
@@ -3256,8 +3252,9 @@ async fn handle_move_schematic_component(
         Ok(carried) => carried,
         Err(error) => return Ok(error),
     };
-    sch.overwrite()?;
-    let (added, pruned) = reconcile_junctions_after_placement(&sch_path, &before_pins)?;
+    let candidate = sch.to_source();
+    let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
+    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
     let moved_markers =
         match observed_no_connect_moves(&sch_path, "move_schematic_component", &carried)? {
             Ok(moved) => moved,
@@ -3282,71 +3279,6 @@ async fn handle_move_schematic_component(
     Ok(CallToolResult::json(&result))
 }
 
-/// Pin endpoints to diff against once a placement change has been written.
-///
-/// A sheet with no wire has no dot to strand and nowhere for a pin to land, so
-/// it answers empty from the one read rather than walking its symbols.
-fn pins_before_placement_change(path: &std::path::Path) -> Vec<(f64, f64)> {
-    let Ok(content) = read_consistent(path) else {
-        return Vec::new();
-    };
-    if !content.contains("(wire") {
-        return Vec::new();
-    }
-    parse_sexp(&content)
-        .map(|tree| crate::tools::all_pin_endpoints(&tree))
-        .unwrap_or_default()
-}
-
-/// Pin endpoints on the sheet as it currently stands on disk, or empty if it
-/// cannot be read — the caller only ever diffs two of these.
-fn pin_endpoints_of(path: &std::path::Path) -> Vec<(f64, f64)> {
-    read_consistent(path)
-        .ok()
-        .and_then(|c| konnect_sexp::parse_sexp(&c).ok())
-        .map(|t| crate::tools::all_pin_endpoints(&t))
-        .unwrap_or_default()
-}
-
-/// Re-judge junction dots wherever a pin appeared or disappeared.
-///
-/// The points that matter are exactly the symmetric difference of the pin sets:
-/// a dot at a vacated position may now be stranded, and a pin that has landed
-/// mid-span on a wire needs one. Everything else on the sheet is untouched, so
-/// unrelated dots cannot be disturbed.
-///
-/// Named for the placement rather than the move because a turn relocates pin
-/// endpoints exactly as a move does, and reaches this by the same route (#615).
-fn reconcile_junctions_after_placement(
-    path: &std::path::Path,
-    before_pins: &[(f64, f64)],
-) -> anyhow::Result<(usize, usize)> {
-    const TOL: f64 = 0.01;
-    let after_pins = pin_endpoints_of(path);
-    let differs = |a: &[(f64, f64)], b: &[(f64, f64)]| -> Vec<(f64, f64)> {
-        a.iter()
-            .copied()
-            .filter(|&(x, y)| {
-                !b.iter()
-                    .any(|&(ox, oy)| konnect_sexp::geometry::points_coincident(x, y, ox, oy, TOL))
-            })
-            .collect()
-    };
-    let mut points = differs(before_pins, &after_pins);
-    points.extend(differs(&after_pins, before_pins));
-    if points.is_empty() {
-        return Ok((0, 0));
-    }
-    let content = read_consistent(path)?;
-    let expected = content.clone();
-    let (new_content, added, pruned) =
-        crate::tools::sch_wiring::reconcile_junctions_at(content, &points);
-    if added > 0 || pruned > 0 {
-        write_atomic_if_unchanged(path, &expected, &new_content)?;
-    }
-    Ok((added, pruned))
-}
-
 async fn handle_rotate_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -3361,14 +3293,8 @@ async fn handle_rotate_schematic_component(
         Err(e) => return Ok(e),
     };
 
-    // A turn relocates pin endpoints exactly as a move does, so it owes the
-    // sheet the same junction reconciliation (#615): the dot a pin turns off
-    // is stranded, and a pin that turns onto a wire mid-span needs one or the
-    // connection is absent from the netlist.
-    let before_pins = pins_before_placement_change(&sch_path);
-
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    let before_source = sch.to_source();
+    let before_source = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
     let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
@@ -3405,8 +3331,9 @@ async fn handle_rotate_schematic_component(
         Ok(carried) => carried,
         Err(error) => return Ok(error),
     };
-    sch.overwrite()?;
-    let (added, pruned) = reconcile_junctions_after_placement(&sch_path, &before_pins)?;
+    let candidate = sch.to_source();
+    let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
+    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
     let moved_markers =
         match observed_no_connect_moves(&sch_path, "rotate_schematic_component", &carried)? {
             Ok(moved) => moved,

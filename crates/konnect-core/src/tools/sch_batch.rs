@@ -954,13 +954,10 @@ async fn handle_bulk_move(
         }
     }
 
-    const TOL: f64 = 0.01;
-    // Junction reconciliation needs the pins that moved (#120); the no-connect
-    // carry needs the symbols behind them (#626). Both read the same two sheet
-    // states, so each side is parsed once and the tree shared. A sheet with
-    // neither wires nor markers has no work for either and is not parsed at
-    // all.
-    let needs_trees = expected.contains("(wire") || expected.contains("(no_connect");
+    // No-connect carry needs the symbols behind its markers (#626). Junction
+    // reconciliation owns the content-to-content pin diff below (#624), so a
+    // sheet without markers skips this separate planning parse entirely.
+    let needs_trees = expected.contains("(no_connect");
     let tree_of = |src: &str| -> Option<konnect_sexp::SexpNode> {
         needs_trees
             .then(|| konnect_sexp::parse_sexp(src).ok())
@@ -970,29 +967,6 @@ async fn handle_bulk_move(
 
     let new_content = apply_edits(content, edits);
     let after_tree = tree_of(&new_content);
-
-    // No wires means nothing can be justified and nothing can be landed on, so
-    // the junction pass gets no candidates — the marker carry below still runs,
-    // since a marker follows its pin whether or not the sheet has wires.
-    let has_wires = expected.contains("(wire");
-    let pins_of = |tree: &Option<konnect_sexp::SexpNode>| -> Vec<(f64, f64)> {
-        tree.as_ref()
-            .filter(|_| has_wires)
-            .map(crate::tools::all_pin_endpoints)
-            .unwrap_or_default()
-    };
-    let (before_pins, after_pins) = (pins_of(&before_tree), pins_of(&after_tree));
-    let differs = |a: &[(f64, f64)], b: &[(f64, f64)]| -> Vec<(f64, f64)> {
-        a.iter()
-            .copied()
-            .filter(|&(x, y)| {
-                !b.iter()
-                    .any(|&(ox, oy)| konnect_sexp::geometry::points_coincident(x, y, ox, oy, TOL))
-            })
-            .collect()
-    };
-    let mut points = differs(&before_pins, &after_pins);
-    points.extend(differs(&after_pins, &before_pins));
 
     // A no-connect belongs to the pin, not to the coordinate it was dropped
     // on, so it travels in this same write — and the reconciliation below then
@@ -1019,7 +993,7 @@ async fn handle_bulk_move(
     };
 
     let (new_content, junctions_added, junctions_pruned) =
-        crate::tools::sch_wiring::reconcile_junctions_at(new_content, &points);
+        crate::tools::sch_wiring::reconcile_junctions_for_placement(&expected, new_content);
 
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
