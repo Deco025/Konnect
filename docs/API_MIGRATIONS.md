@@ -275,26 +275,50 @@ changes for any caller that set the address explicitly. Discovery still only
 ever runs at startup, so a server launched before KiCad stays unresolved for its
 lifetime — see `docs/TROUBLESHOOTING.md`.
 
-## Unreleased: `check_clearance` says what it measures (minor release)
+## Unreleased: `check_clearance` adds explicit courtyard spacing (minor release)
 
 `check_clearance` returned the straight-line distance between two footprints'
 placement anchors under a description that said "physical clearance". Read as
 copper-to-copper spacing, a `21.125` answer stood in for a courtyard gap of
 about 3 mm (#410). Footprint size and shape were never considered.
 
-Stage 1 changes nothing about the number and everything about what the
-response says it is:
+Stage 1 changed nothing about the number and everything about what the response
+says it is:
 
 - `measurement: "anchor_to_anchor"` and `anchor_distance_mm` are added; the
   latter is the value `distance_mm` carried.
 - `distance_mm` is kept, identical, as a **deprecated** alias, listed in a new
-  `deprecated_fields` array so a consumer can see it without reading prose. It
-  will be removed by the stage-2 PR that adds a real physical-spacing mode.
+  `deprecated_fields` array so a consumer can see it without reading prose.
 - `note` states in words that this is not pad, trace or courtyard clearance.
 - The tool description and the directory row no longer claim clearance, and
   point to `run_drc` for the question the old description implied.
 
-No argument changed. This is `Part of #410`; the terminal change is stage 2.
+Stage 2 adds an optional `mode` argument. The compatibility default remains
+`"anchor"`, so existing calls keep the same fields and number. The new
+`"courtyard"` mode returns:
+
+- `measurement: "courtyard_bbox_edge_to_edge"` and
+  `courtyard_clearance_mm`, measured between the axis-aligned board-space hulls
+  of the two transformed, authored courtyards;
+- `geometry1` / `geometry2`, including each measured bbox and footprint
+  rotation, plus `side1`, `side2`, and the actual `source` (`ipc` or
+  `saved_file`);
+- `overlaps: true` with a zero distance when the two same-side hulls overlap;
+  touching hulls have zero distance and `overlaps: false`;
+- a structured unavailable result when either authored courtyard is absent or
+  unreadable. Pad and anchor fallbacks are deliberately not substituted;
+- `reason_code: "opposite_board_sides"` and `applicable: false` for footprints
+  on opposite sides, rather than presenting their projected bboxes as a
+  placement collision.
+
+Both modes read a read-only IPC serialization when the requested board is open
+in KiCad and otherwise read the saved file. This remains a placement-spacing
+tool, not an electrical-clearance oracle: run `run_drc` for copper clearance.
+For non-cardinal footprint rotations, the reported bbox is the conservative
+axis-aligned hull of the rotated courtyard artwork.
+
+`distance_mm` remains available only in `anchor` mode as a deprecated alias;
+this additive release does not remove it. This terminal stage closes #410.
 
 ## Unreleased: `update_pcb_from_schematic` reports an unassigned footprint (minor release)
 

@@ -65,7 +65,7 @@ Load additional toolsets as needed:
 
 ```
 load_toolset('config')           # design rule storage: add_design_rule, list_design_rules
-load_toolset('verification')     # run_drc, set_design_rules, set_predefined_sizes, check_clearance
+load_toolset('verification')     # run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode)
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
