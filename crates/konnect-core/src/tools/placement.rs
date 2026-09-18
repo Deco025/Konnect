@@ -62,8 +62,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Plan (and optionally apply) a row of decoupling capacitors beside an IC, from \
          capacitor references YOU supply — this tool never infers which caps decouple which \
          IC (a shared net, GND above all, is not evidence of that pairing). Every reference \
-         must already be a capacitor-family footprint on the board; an unknown or non-\
-         capacitor reference is refused before anything is planned. The response's \
+         must already name a footprint on the board with usable courtyard geometry; an \
+         unknown or unplaceable reference is refused before anything is planned. The response's \
          plan_status is 'applicable' only when every planned target lands inside the board \
          outline AND the plan actually improves score_placement's score — otherwise it is \
          'blocked' with blocking_reasons naming why, and apply refuses before the first \
@@ -512,8 +512,6 @@ async fn handle_place_decoupling(
     let content = konnect_sexp::writer::read_consistent(&board)?;
     let tree = konnect_sexp::parse_sexp(&content)?;
     let scan = footprint_courtyards(&tree);
-    let values = footprint_values(&tree);
-
     let Some(ic) = scan
         .items
         .iter()
@@ -530,9 +528,11 @@ async fn handle_place_decoupling(
     let ic_bbox = ic.bbox;
     let (ic_cx, ic_cy) = bbox_center(ic_bbox);
 
-    // Every requested reference must exist and be a decoupling-family
-    // capacitor. Refused up front, naming every bad reference at once — no
-    // partial plan built from the references that did resolve.
+    // Exact caller-supplied references are the design-intent boundary. Do not
+    // second-guess them with a C* prefix or value-family heuristic: that would
+    // reintroduce the inference this change removes. Refuse only references
+    // that are absent or cannot supply the courtyard geometry this planner
+    // mechanically requires, naming every bad reference before planning.
     let mut duplicates: BTreeSet<String> = BTreeSet::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for r in &requested_refs {
@@ -553,6 +553,7 @@ async fn handle_place_decoupling(
         ));
     }
     let mut caps: Vec<&FootprintCourtyard> = Vec::with_capacity(requested_refs.len());
+    let board_references = footprint_references(&tree);
     let mut bad_refs: Vec<String> = Vec::new();
     for r in &requested_refs {
         let found = scan
@@ -560,15 +561,10 @@ async fn handle_place_decoupling(
             .iter()
             .find(|c| c.reference.as_deref() == Some(r.as_str()));
         match found {
-            Some(c)
-                if ref_prefix(r) == "C"
-                    && values
-                        .get(r)
-                        .is_some_and(|v| decoupling_limit_mm(v).is_some()) =>
-            {
-                caps.push(c);
+            Some(c) => caps.push(c),
+            None if board_references.contains(r) => {
+                bad_refs.push(format!("{r} (no usable courtyard geometry)"));
             }
-            Some(_) => bad_refs.push(format!("{r} (not a decoupling-family capacitor)")),
             None => bad_refs.push(format!("{r} (not on this board)")),
         }
     }
@@ -688,10 +684,17 @@ async fn handle_place_decoupling(
     }
 
     if applicability.is_blocked() {
-        return Ok(CallToolResult::error(format!(
-            "place_decoupling_caps refuses to apply a blocked plan: {}",
-            applicability.blocking_reasons().join("; ")
-        )));
+        let reasons = applicability.blocking_reasons().to_vec();
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::PlanBlocked {
+                operation: "place_decoupling_caps".into(),
+                reasons: reasons.clone(),
+            },
+            format!(
+                "place_decoupling_caps refuses to apply a blocked plan: {}",
+                reasons.join("; ")
+            ),
+        ));
     }
 
     // Applying: never edit a board a live KiCad holds open.
@@ -1806,6 +1809,30 @@ fn footprint_values(tree: &SexpNode) -> HashMap<String, String> {
     map
 }
 
+/// Every reference authored on the board, including legacy `fp_text`
+/// reference fields. This is deliberately identity-only: exact caller input
+/// replaces any attempt to infer part role from a reference prefix or value.
+fn footprint_references(tree: &SexpNode) -> BTreeSet<String> {
+    let mut references = BTreeSet::new();
+    for fp in footprints(tree) {
+        let current = fp
+            .find_all("property")
+            .into_iter()
+            .find(|property| property.get(1).and_then(|node| node.as_str()) == Some("Reference"))
+            .and_then(|property| property.get(2).and_then(|node| node.as_str()))
+            .or_else(|| {
+                fp.find_all("fp_text")
+                    .into_iter()
+                    .find(|text| text.get(1).and_then(|node| node.as_str()) == Some("reference"))
+                    .and_then(|text| text.get(2).and_then(|node| node.as_str()))
+            });
+        if let Some(reference) = current {
+            references.insert(reference.to_string());
+        }
+    }
+    references
+}
+
 /// The leading alphabetic run of a reference designator: `"C12"` → `"C"`,
 /// `"CN3"` → `"CN"` (which is *not* a capacitor), `"J1"` → `"J"`. An exact
 /// prefix match, so jumpers (JP) and connectors sold as CN never misclassify.
@@ -2912,17 +2939,17 @@ mod tests {
 
     /// #596: this tool never discovers candidates by net — an unrelated cap
     /// (however tempting a shared GND makes it) is only ever placed if the
-    /// caller names it, and a nonexistent or non-capacitor reference is a
-    /// structured error naming exactly what was wrong, not a silent skip.
+    /// caller names it, and a nonexistent reference is a structured error
+    /// naming exactly what was wrong, not a silent skip.
     #[tokio::test]
-    async fn decoupling_refuses_an_unknown_or_non_capacitor_reference() {
+    async fn decoupling_refuses_an_unknown_reference() {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let result = handle_place_decoupling(
             &json!({
                 "board": board.to_string_lossy(),
                 "ic_reference": "U1",
-                "capacitor_references": ["C404", "R1"],
+                "capacitor_references": ["C404"],
             }),
             &test_ctx(),
         )
@@ -2935,7 +2962,28 @@ mod tests {
         );
         let text = result_text(&result);
         assert!(text.contains("C404"), "{text}");
-        assert!(text.contains("R1"), "{text}");
+    }
+
+    /// Exact caller selection is the design-intent boundary. A present
+    /// footprint is accepted without a reference-prefix or value-family
+    /// heuristic, even when its designator is not C*.
+    #[tokio::test]
+    async fn decoupling_does_not_second_guess_an_exact_existing_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["R1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body = text_of(&result).await;
+        assert_eq!(body["planned_moves"][0]["reference"], "R1", "{body}");
     }
 
     #[tokio::test]
@@ -3049,6 +3097,78 @@ mod tests {
                 .iter()
                 .any(|r| r.as_str().unwrap().contains("outside the board outline")),
             "{response}"
+        );
+    }
+
+    /// The public MCP route must expose the same refusal reasons during dry
+    /// run and apply, and a refused apply must leave the board byte-identical.
+    #[tokio::test]
+    async fn served_decoupling_block_is_structured_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = write_variant(
+            &dir,
+            "u1_near_bottom_edge.kicad_pcb",
+            fixture_with_moved_root("(at 25 20)", "(at 25 42)"),
+        );
+        let before = std::fs::read(&board).unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let call = |id, dry_run| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "place_decoupling_caps",
+                    "arguments": {
+                        "board": board.to_string_lossy(),
+                        "ic_reference": "U1",
+                        "capacitor_references": ["C1", "C2"],
+                        "dry_run": dry_run
+                    }
+                }
+            })
+        };
+
+        let dry_response = handler
+            .handle_message(call(596, true))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let dry_body: serde_json::Value =
+            serde_json::from_str(dry_response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(dry_response["isError"], json!(false), "{dry_body}");
+        assert_eq!(dry_body["plan_status"], "blocked", "{dry_body}");
+        let dry_reasons = dry_body["blocking_reasons"].clone();
+        assert!(dry_reasons.as_array().is_some_and(|r| !r.is_empty()));
+
+        let apply_response = handler
+            .handle_message(call(597, false))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let apply_body: serde_json::Value =
+            serde_json::from_str(apply_response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(apply_response["isError"], json!(true), "{apply_body}");
+        assert_eq!(apply_body["error"]["kind"], "plan_blocked", "{apply_body}");
+        assert_eq!(apply_body["error"]["operation"], "place_decoupling_caps");
+        assert_eq!(apply_body["error"]["reasons"], dry_reasons);
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            before,
+            "a plan_blocked refusal must not write"
         );
     }
 

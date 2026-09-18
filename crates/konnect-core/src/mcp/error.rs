@@ -78,6 +78,13 @@ pub enum ToolErrorKind {
     /// The caller named a target, but its observed editor or document state
     /// no longer agrees with the state required to mutate it safely.
     StaleTarget { target: String, reason: String },
+    /// A valid request produced a plan, but applying that plan would be unsafe
+    /// or would not improve the requested result. The same reasons are exposed
+    /// by dry-run planning so callers can revise the request without guessing.
+    PlanBlocked {
+        operation: String,
+        reasons: Vec<String>,
+    },
     /// No live editor endpoint is configured or reachable for the requested
     /// semantic operation.
     EditorUnavailable { editor: String, reason: String },
@@ -138,6 +145,7 @@ impl ToolErrorKind {
             Self::WrongProject { .. } => "wrong_project",
             Self::WrongSheetInstance { .. } => "wrong_sheet_instance",
             Self::StaleTarget { .. } => "stale_target",
+            Self::PlanBlocked { .. } => "plan_blocked",
             Self::EditorUnavailable { .. } => "editor_unavailable",
             Self::UnsupportedCapability { .. } => "unsupported_capability",
             Self::ReadbackMismatch { .. } => "readback_mismatch",
@@ -287,6 +295,10 @@ mod tests {
             ToolErrorKind::StaleTarget {
                 target: "p".into(),
                 reason: "r".into(),
+            },
+            ToolErrorKind::PlanBlocked {
+                operation: "place".into(),
+                reasons: vec!["outside board".into()],
             },
             ToolErrorKind::EditorUnavailable {
                 editor: "pcb".into(),
