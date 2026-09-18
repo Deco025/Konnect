@@ -3,6 +3,20 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: batch placement preserves pin-on-wire connectivity
+
+`batch_place_components` previously placed a pin directly on the interior of
+an existing wire without adding the junction KiCad requires at that point. The
+sheet looked connected, the tool reported a complete placement, but KiCad's
+netlister left the pin unconnected. Single-component placement already handled
+the same geometry correctly.
+
+Batch placement now reconciles every new pin endpoint once after planning the
+whole batch and commits the symbols and required junctions in one conditional
+atomic write. Its response gains `junctions_added_count` and
+`junctions_pruned_count`; existing fields keep their meanings. A batch that
+does not change junction state reports zero for both fields.
+
 ## Unreleased: `set_active_layer` refuses instead of corrupting KiCad 10 boards
 
 `set_active_layer` previously inserted an `(active_layer "...")` entry into the
@@ -68,9 +82,10 @@ A placement change that carries nothing reports `0` and `[]`. No existing field
 changes meaning, and `junctions_added_count` on a move or bulk shift can now be
 `0` where it was `1`, which is the fix.
 
-`move_region`, `replace_component` and `batch_place_components` reconcile no
-junctions at all yet (#622, #623, #625) and are unchanged here; they inherit
-this contract when they gain reconciliation.
+`move_region` and `replace_component` reconcile no junctions at all yet (#623,
+#625) and are unchanged here; they inherit this contract when they gain
+reconciliation. `batch_place_components` now reconciles its newly placed pins
+as documented above (#622).
 
 A placement change that cannot follow a marker one-to-one now **refuses before
 writing** instead of orphaning it:
