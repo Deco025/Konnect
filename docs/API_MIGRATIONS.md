@@ -961,3 +961,17 @@ reproducing KiCad's own 3D-model flip transform for that path remains out of
 scope. `flip_component`'s tool description and `BoardAccess` classification
 changed from "requires a closed board" to live-preferred-with-fallback to
 reflect this; existing closed-board callers are unaffected.
+
+## Unreleased: `add_net` is idempotent on legacy boards
+
+`add_net` now returns an existing legacy net's observed numeric ID without
+writing when the requested name is already declared. Its JSON response adds a
+`created` boolean so callers can distinguish a new insertion from an idempotent
+no-op. New declarations use the board's newline convention, canonical tab
+indentation, escaped S-expression text, and an ID one greater than the highest
+observed top-level declaration.
+
+KiCad 10 boards still refuse the operation before writing because they have no
+top-level numeric net table. That refusal is now the structured
+`unsupported_capability` kind. Create a KiCad 10 net by naming it on a pad or
+copper item instead.
