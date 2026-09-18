@@ -283,7 +283,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `add_net` | Add a new net entry to the PCB file (S-expression insert, no IPC required). Pre-KiCad-10 boards only: KiCad 10 has no top-level net table, so this fails closed there and points at `route_trace` / `add_via` / `add_copper_pour`, which create a net by naming it on copper. |
+| `add_net` | Idempotently add a net to a pre-KiCad-10 board's top-level net table (S-expression insert, no IPC required). Existing names return their observed ID without writing. KiCad 10 has no top-level net table, so this fails closed there and points at `route_trace` / `add_via` / `add_copper_pour`, which create a net by naming it on copper. |
 | `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |
