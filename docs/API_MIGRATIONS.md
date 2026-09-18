@@ -921,3 +921,30 @@ identical without it.
 
 These removals narrow the schema to behavior Konnect can verify. They do not change
 the generated files or analysis because the removed values had no implementation.
+
+## Unreleased: `flip_component` on an open board uses KiCad 10.0.6's native `FlipItems`
+
+`flip_component` previously refused unconditionally whenever KiCad was
+reachable, because the vendored IPC protocol had no footprint-flip command
+(#604). KiCad 10.0.6 added a native `FlipItems` command, so a board that is
+open live in KiCad **10.0.6 or newer** now flips through that command inside
+one KiCad undo transaction — the same transform the GUI's **F** key performs,
+including the footprint's 3D-model offset/rotation — and reports
+`"source": "ipc"`. Konnect never saves the board on this path.
+
+A reachable KiCad older than 10.0.6 (or any endpoint without the handler)
+answers `AS_UNHANDLED`; Konnect reports this as a structured
+`unsupported_capability` error naming the observed KiCad version and the
+10.0.6 requirement, rather than falling back to editing the file. A mutation
+that appears to succeed but whose fresh post-flip readback cannot confirm the
+result returns a distinct `mutation_outcome_uncertain` error instead of either
+success or a plain failure — inspect the board in KiCad and reconcile before
+retrying.
+
+The **closed-board** file fallback is unchanged and only reachable when no
+live KiCad holds the named board at all: it keeps refusing any footprint whose
+3D model carries a non-zero `offset.y`, `rotate.x`, or `rotate.y`, since
+reproducing KiCad's own 3D-model flip transform for that path remains out of
+scope. `flip_component`'s tool description and `BoardAccess` classification
+changed from "requires a closed board" to live-preferred-with-fallback to
+reflect this; existing closed-board callers are unaffected.
