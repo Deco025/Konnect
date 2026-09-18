@@ -475,7 +475,7 @@ fn standalone_rotation_fixture() -> (tempfile::TempDir, PathBuf) {
     (directory, path)
 }
 
-async fn served_batch_place_on_netc(path: &Path) -> Value {
+async fn served_batch_place(path: &Path, y: f64) -> Value {
     let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
         kicad_cli: String::new(),
         kicad_binary: String::new(),
@@ -493,8 +493,39 @@ async fn served_batch_place_on_netc(path: &Path) -> Value {
             "schematic": path.display().to_string(),
             "components": [{
                 "lib_id": "Device:R", "reference": "R5", "value": "22k",
-                "x": 184.15, "y": 85.09
+                "x": 184.15, "y": y
             }]
+        }}}))
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+async fn served_batch_place_on_netc(path: &Path) -> Value {
+    served_batch_place(path, 85.09).await
+}
+
+async fn served_move_region(path: &Path, center_y: f64, dy: f64) -> Value {
+    let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+        kicad_cli: String::new(),
+        kicad_binary: String::new(),
+        ipc_address: String::new(),
+        project_dir: None,
+        jlcpcb_db_path: None,
+        auto_load_toolsets: true,
+        eager_toolsets: false,
+    })
+    .await
+    .unwrap();
+    let result = handler
+        .handle_message(json!({"jsonrpc": "2.0", "id": 623, "method": "tools/call",
+        "params": {"name": "move_region", "arguments": {
+            "schematic": path.display().to_string(),
+            "x1": 183.0, "y1": center_y - 1.0,
+            "x2": 185.0, "y2": center_y + 1.0,
+            "dx": 0.0, "dy": dy
         }}}))
         .await
         .unwrap()
@@ -531,6 +562,31 @@ async fn served_batch_placement_adds_the_junction_for_a_pin_on_a_wire() {
     );
 }
 
+/// Region movement reconciles the entire placement as one change. Moving the
+/// same pin onto and then off NETC must add and prune exactly the one dot whose
+/// electrical meaning changed, while both responses come through served MCP.
+#[tokio::test]
+async fn served_region_move_adds_and_prunes_the_junction_for_a_pin_on_a_wire() {
+    let (_directory, path) = standalone_rotation_fixture();
+    let placed = served_batch_place(&path, 72.39).await;
+    assert_eq!(placed["junctions_added_count"], 0, "{placed}");
+
+    let onto_wire = served_move_region(&path, 72.39, 12.7).await;
+    assert_eq!(onto_wire["moved"], json!(["R5"]), "{onto_wire}");
+    assert_eq!(onto_wire["moved_unit_count"], 1, "{onto_wire}");
+    assert_eq!(onto_wire["placements"][0]["y"], 85.09, "{onto_wire}");
+    assert_eq!(onto_wire["junctions_added_count"], 1, "{onto_wire}");
+    assert_eq!(onto_wire["junctions_pruned_count"], 0, "{onto_wire}");
+    let committed = std::fs::read_to_string(&path).unwrap();
+    assert!(has_junction(&committed, BATCH_LANDING_POINT));
+
+    let off_wire = served_move_region(&path, 85.09, 12.7).await;
+    assert_eq!(off_wire["junctions_added_count"], 0, "{off_wire}");
+    assert_eq!(off_wire["junctions_pruned_count"], 1, "{off_wire}");
+    let committed = std::fs::read_to_string(&path).unwrap();
+    assert!(!has_junction(&committed, BATCH_LANDING_POINT));
+}
+
 /// KiCad's netlister is the electrical oracle: the same pin at the same drawn
 /// coordinate is connected only when the batch path writes the junction.
 #[tokio::test]
@@ -538,6 +594,31 @@ async fn served_batch_placement_adds_the_junction_for_a_pin_on_a_wire() {
 async fn kicad_netlist_connects_the_batch_placed_pin_to_netc() {
     let (_directory, path) = standalone_rotation_fixture();
     let response = served_batch_place_on_netc(&path).await;
+    assert_eq!(response["junctions_added_count"], 1, "{response}");
+
+    let output = path.with_extension("net");
+    let cli = crate::kicad_install::find_cli("").expect("installed kicad-cli");
+    crate::tools::cli::export_netlist(&cli.display().to_string(), &path, &output, "kicadsexpr")
+        .await
+        .unwrap();
+    let netlist = std::fs::read_to_string(output).unwrap();
+    let netc = netlist
+        .split("(net")
+        .find(|net| net.contains("(name \"/NETC\")"))
+        .expect("NETC in KiCad netlist");
+    assert!(netc.contains("(ref \"R5\")"), "{netc}");
+    assert!(netc.contains("(pin \"2\")"), "{netc}");
+}
+
+/// KiCad's exported netlist is the electrical oracle for the region path too:
+/// the moved pin is on NETC only when `move_region` commits the required dot.
+#[tokio::test]
+#[ignore = "needs an installed KiCad 10 kicad-cli"]
+async fn kicad_netlist_connects_the_region_moved_pin_to_netc() {
+    let (_directory, path) = standalone_rotation_fixture();
+    let placed = served_batch_place(&path, 72.39).await;
+    assert_eq!(placed["junctions_added_count"], 0, "{placed}");
+    let response = served_move_region(&path, 72.39, 12.7).await;
     assert_eq!(response["junctions_added_count"], 1, "{response}");
 
     let output = path.with_extension("net");
