@@ -1012,6 +1012,57 @@ mod reliability_contract_dispatch_tests {
 }
 
 #[cfg(test)]
+mod active_layer_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn set_active_layer_refusal_survives_served_dispatch_without_writing() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("safe.kicad_pcb");
+        let original = b"(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(setup\n\t\t(pad_to_mask_clearance 0)\n\t)\n)\n";
+        std::fs::write(&board, original).unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 610,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_active_layer",
+                    "arguments": {
+                        "board": board.display().to_string(),
+                        "layer": "B.Cu"
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("JSON-RPC tool result");
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+
+        assert_eq!(body["error"]["kind"], "unsupported_capability");
+        assert_eq!(body["error"]["capability"], "set_active_layer");
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+}
+
+#[cfg(test)]
 mod annotate_dispatch_tests {
     use super::*;
     use crate::tools::ServerConfig;

@@ -3,6 +3,19 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `set_active_layer` refuses instead of corrupting KiCad 10 boards
+
+`set_active_layer` previously inserted an `(active_layer "...")` entry into the
+board's `(setup ...)` block. KiCad 10.0.6 does not support that document token:
+active layer is editor-session state, and a board containing the inserted entry
+cannot be loaded.
+
+The tool now returns a structured `unsupported_capability` error and leaves the
+board byte-identical. There is no supported replacement call in the bundled
+stable KiCad IPC protocol. If v0.12.0 already changed a board, close it, make a
+backup, remove only the injected `(active_layer "...")` line, and reopen it.
+See [Troubleshooting](TROUBLESHOOTING.md#a-board-no-longer-opens-after-set_active_layer).
+
 ## Unreleased: a stale-target refusal is bounded, not one line per symbol (patch release)
 
 Every mutating schematic tool preflights placed-symbol instance metadata. When
