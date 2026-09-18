@@ -71,7 +71,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Place multiple symbols from KiCAD libraries in one write with committed-file \
              readback. Preserves every saved hierarchy instance and preflights stale metadata \
              before any placement. Copies each library Value and Footprint unless that entry \
-             explicitly overrides it. \
+             explicitly overrides it. Pins that land mid-segment on an existing wire gain the \
+             required junction in the same atomic write; the response reports \
+             junctions_added_count and junctions_pruned_count. \
              Pass explicit references -- there is no auto-numbering; an omitted reference \
              becomes '?' like an eeschema-unannotated symbol, same as add_schematic_component.",
             json!({
@@ -494,7 +496,8 @@ async fn handle_batch_place_components(
         None => return Ok(CallToolResult::error("Missing 'components' array")),
     };
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
+    let before_source = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
     let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
         Ok(context) => context,
         Err(error) => return Ok(error.into_tool_result()),
@@ -601,8 +604,15 @@ async fn handle_batch_place_components(
     }
 
     let mut placed = Vec::new();
+    let mut junctions_added = 0;
+    let mut junctions_pruned = 0;
     if !placements.is_empty() {
-        if let Err(error) = sch.overwrite() {
+        let candidate = sch.to_source();
+        let (candidate, added, pruned) =
+            super::sch_wiring::reconcile_junctions_for_placement(&before_source, candidate);
+        junctions_added = added;
+        junctions_pruned = pruned;
+        if let Err(error) = write_atomic_if_unchanged(&sch_path, &before_source, &candidate) {
             let result = super::mutation_outcome_uncertain(
                 &sch_path,
                 "batch_place_components",
@@ -691,6 +701,8 @@ async fn handle_batch_place_components(
     let mut result = CallToolResult::json(&json!({
         "placed": placed,
         "placed_count": placed.len(),
+        "junctions_added_count": junctions_added,
+        "junctions_pruned_count": junctions_pruned,
         "errors": errors,
         "failures": failures
     }));

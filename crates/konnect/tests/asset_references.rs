@@ -720,6 +720,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "sheet_instance_path",
         // Structured placement-score response field, not a callable tool.
         "interface_filter_caps",
+        // Structured schematic-placement response fields, not callable tools.
+        "junctions_added_count",
+        "junctions_pruned_count",
         // Structured DRC ownership response field and its unresolved values,
         // not callable tools (#413).
         "ownership_status",

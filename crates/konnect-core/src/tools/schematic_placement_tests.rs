@@ -458,6 +458,102 @@ async fn served_place(child: &Path) -> (String, Value) {
     (text, body)
 }
 
+const ROTATION_JUNCTIONS: &str =
+    include_str!("../../tests/fixtures/rotate_junctions_kicad10.kicad_sch");
+const BATCH_LANDING_POINT: (f64, f64) = (184.15, 88.9);
+
+fn standalone_rotation_fixture() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("rotate.kicad_sch");
+    // The source fixture was saved as a standalone, unsaved KiCad document,
+    // so its native project field is empty. Once it has a filename, placement
+    // correctly requires that field to match the stem. Change only that saved
+    // identity; geometry, library records, pins, wires and UUIDs remain the
+    // KiCad 10.0.6 output described by the fixture README.
+    let content = ROTATION_JUNCTIONS.replace("(project \"\"", "(project \"rotate\"");
+    std::fs::write(&path, content).unwrap();
+    (directory, path)
+}
+
+async fn served_batch_place_on_netc(path: &Path) -> Value {
+    let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+        kicad_cli: String::new(),
+        kicad_binary: String::new(),
+        ipc_address: String::new(),
+        project_dir: None,
+        jlcpcb_db_path: None,
+        auto_load_toolsets: true,
+        eager_toolsets: false,
+    })
+    .await
+    .unwrap();
+    let result = handler
+        .handle_message(json!({"jsonrpc": "2.0", "id": 622, "method": "tools/call",
+        "params": {"name": "batch_place_components", "arguments": {
+            "schematic": path.display().to_string(),
+            "components": [{
+                "lib_id": "Device:R", "reference": "R5", "value": "22k",
+                "x": 184.15, "y": 85.09
+            }]
+        }}}))
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+fn has_junction(content: &str, point: (f64, f64)) -> bool {
+    let tree = konnect_sexp::parse_sexp(content).unwrap();
+    konnect_sexp::schematic::extract_junctions(&tree)
+        .iter()
+        .any(|&(x, y)| konnect_sexp::geometry::points_coincident(point.0, point.1, x, y, 0.01))
+}
+
+/// The public dispatch must report and commit the dot that makes the placed
+/// pin electrically part of NETC. The fixture is KiCad 10.0.6 serialization;
+/// its README records the independent netlist behavior behind this oracle.
+#[tokio::test]
+async fn served_batch_placement_adds_the_junction_for_a_pin_on_a_wire() {
+    let (_directory, path) = standalone_rotation_fixture();
+    assert!(!has_junction(ROTATION_JUNCTIONS, BATCH_LANDING_POINT));
+
+    let response = served_batch_place_on_netc(&path).await;
+
+    assert_eq!(response["outcome"]["status"], "complete", "{response}");
+    assert_eq!(response["placed_count"], 1, "{response}");
+    assert_eq!(response["junctions_added_count"], 1, "{response}");
+    assert_eq!(response["junctions_pruned_count"], 0, "{response}");
+    let committed = std::fs::read_to_string(path).unwrap();
+    assert!(
+        has_junction(&committed, BATCH_LANDING_POINT),
+        "without this dot KiCad leaves R5.2 unconnected from NETC"
+    );
+}
+
+/// KiCad's netlister is the electrical oracle: the same pin at the same drawn
+/// coordinate is connected only when the batch path writes the junction.
+#[tokio::test]
+#[ignore = "needs an installed KiCad 10 kicad-cli"]
+async fn kicad_netlist_connects_the_batch_placed_pin_to_netc() {
+    let (_directory, path) = standalone_rotation_fixture();
+    let response = served_batch_place_on_netc(&path).await;
+    assert_eq!(response["junctions_added_count"], 1, "{response}");
+
+    let output = path.with_extension("net");
+    let cli = crate::kicad_install::find_cli("").expect("installed kicad-cli");
+    crate::tools::cli::export_netlist(&cli.display().to_string(), &path, &output, "kicadsexpr")
+        .await
+        .unwrap();
+    let netlist = std::fs::read_to_string(output).unwrap();
+    let netc = netlist
+        .split("(net")
+        .find(|net| net.contains("(name \"/NETC\")"))
+        .expect("NETC in KiCad netlist");
+    assert!(netc.contains("(ref \"R5\")"), "{netc}");
+    assert!(netc.contains("(pin \"2\")"), "{netc}");
+}
+
 /// Place into an already-stale sheet, assert the refusal names the requested
 /// schematic and wrote neither file, and return the response text with its
 /// `error.reason`.

@@ -198,6 +198,12 @@ Load `sch_batch` toolset when placing 3 or more components or making bulk connec
 
 Place multiple components in one call. Provide `schematic` and a `components` array of `{lib_id, x, y, rotation?, reference?, value?, unit?}` objects. Pass `reference` explicitly for each component -- it is not auto-assigned.
 
+The batch commits all symbols once, then reconciles every new pin endpoint in
+that same atomic write. Check the "junctions_added_count" and
+"junctions_pruned_count" response fields; a pin placed mid-segment on an
+existing wire is not electrically connected in KiCad unless the required
+junction was added.
+
 ### batch_connect_to_net
 
 Connect multiple pins to the same net in one call. Ideal for:
