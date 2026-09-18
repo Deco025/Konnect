@@ -1242,6 +1242,53 @@ pub(crate) fn observed_no_connect_moves(
     Ok(Ok(moves))
 }
 
+/// Re-judge junction dots after a placement change from two in-memory sheet states.
+///
+/// The only candidate points are pin endpoints in the symmetric difference of
+/// `before` and `after`. A pin that did not move cannot justify touching its
+/// junction, and a sheet with no wires has neither a dot to strand nor a wire
+/// for a pin to land on. Keeping this harness beside [`reconcile_junctions_at`]
+/// gives every placement-changing handler the same short-circuit, pin
+/// extraction, and canonical coincidence tolerance (#624).
+///
+/// Returns the reconciled `after` content plus (added, pruned). The caller owns
+/// the single atomic write that commits the mutation and this reconciliation
+/// together.
+pub(crate) fn reconcile_junctions_for_placement(
+    before: &str,
+    after: String,
+) -> (String, usize, usize) {
+    if !before.contains("(wire") {
+        return (after, 0, 0);
+    }
+
+    let (Ok(before_tree), Ok(after_tree)) = (parse_sexp(before), parse_sexp(&after)) else {
+        return (after, 0, 0);
+    };
+    let before_pins = crate::tools::all_pin_endpoints(&before_tree);
+    let after_pins = crate::tools::all_pin_endpoints(&after_tree);
+    let differs = |a: &[(f64, f64)], b: &[(f64, f64)]| -> Vec<(f64, f64)> {
+        a.iter()
+            .copied()
+            .filter(|&(x, y)| {
+                !b.iter().any(|&(other_x, other_y)| {
+                    konnect_sexp::geometry::points_coincident(
+                        x,
+                        y,
+                        other_x,
+                        other_y,
+                        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+                    )
+                })
+            })
+            .collect()
+    };
+
+    let mut points = differs(&before_pins, &after_pins);
+    points.extend(differs(&after_pins, &before_pins));
+    reconcile_junctions_at(after, &points)
+}
+
 /// Re-evaluate the junction dots at `points` after geometry moved.
 ///
 /// `prune_orphaned_junctions` answers the same question for a *wire* deletion:
@@ -3085,6 +3132,25 @@ mod unit_aware_wiring_tests {
         let stripped = format!("{}{}", &src[..start], &src[end..]);
         assert!(!has_dot(&stripped, "120.65", "139.7"), "dot removed");
         stripped
+    }
+
+    #[test]
+    fn placement_harness_prunes_a_dot_when_its_pin_disappears() {
+        let after = fixture_without_symbol(RECONCILE_SCH, "R1");
+        let (out, added, pruned) = reconcile_junctions_for_placement(RECONCILE_SCH, after);
+
+        assert_eq!((added, pruned), (0, 1));
+        assert!(!has_dot(&out, "120.65", "139.7"));
+    }
+
+    #[test]
+    fn placement_harness_adds_a_dot_when_its_pin_appears() {
+        let before = fixture_without_symbol(RECONCILE_SCH, "R1");
+        let (out, added, pruned) =
+            reconcile_junctions_for_placement(&before, fixture_missing_r1s_dot());
+
+        assert_eq!((added, pruned), (1, 0));
+        assert!(has_dot(&out, "120.65", "139.7"));
     }
 
     /// The positive half of the reconcile: a pin sitting mid-span on exactly
