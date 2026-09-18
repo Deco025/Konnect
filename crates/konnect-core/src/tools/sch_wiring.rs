@@ -934,11 +934,34 @@ fn marker_label(uuid: &str, (x, y): (f64, f64)) -> String {
 /// A placement tool adopts this contract in three steps, in this order: plan
 /// here, apply with [`carry_no_connects`] (typed model) or
 /// [`apply_no_connect_carries`] (S-expression edits) in the same write as the
-/// symbol, then report with [`observed_no_connect_moves`] after it. #622, #623
-/// and #625 reconcile no junctions yet and join by the same route when they do.
+/// symbol, then report with [`observed_no_connect_moves`] after it. #622 and
+/// #623 use the placement identity below; #625 uses the replacement variant
+/// because changing a library symbol deliberately changes local pin geometry.
 pub(crate) fn plan_no_connect_carry(
     before: &konnect_sexp::SexpNode,
     after: &konnect_sexp::SexpNode,
+) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
+    plan_no_connect_carry_with(before, after, true)
+}
+
+/// Follow a no-connect through a symbol replacement by the identity that the
+/// replacement contract preserves: symbol UUID, unit, and pin number.
+///
+/// Local pin geometry is deliberately excluded because replacing a symbol is
+/// allowed to move that pin. The one-to-one check remains strict: a removed,
+/// renumbered, or duplicated pin produces zero or multiple arrivals and
+/// refuses before any write rather than guessing correspondence (#625).
+pub(crate) fn plan_no_connect_carry_for_replacement(
+    before: &konnect_sexp::SexpNode,
+    after: &konnect_sexp::SexpNode,
+) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
+    plan_no_connect_carry_with(before, after, false)
+}
+
+fn plan_no_connect_carry_with(
+    before: &konnect_sexp::SexpNode,
+    after: &konnect_sexp::SexpNode,
+    require_same_local_geometry: bool,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
     const TOL: f64 = crate::tools::sch_connectivity::COINCIDENT_TOLERANCE;
     let coincident = |a: (f64, f64), b: (f64, f64)| {
@@ -974,7 +997,13 @@ pub(crate) fn plan_no_connect_carry(
         for owner in owners {
             let landed: Vec<&IdentifiedPin> = after_pins
                 .iter()
-                .filter(|p| p.identity == owner.identity)
+                .filter(|p| {
+                    p.identity.symbol_uuid == owner.identity.symbol_uuid
+                        && p.identity.unit == owner.identity.unit
+                        && p.identity.number == owner.identity.number
+                        && (!require_same_local_geometry
+                            || p.identity.local_key == owner.identity.local_key)
+                })
                 .collect();
             let [arrival] = landed[..] else {
                 return Err(NoConnectCarryError::Unmappable {
@@ -4203,10 +4232,80 @@ mod no_connect_carry_tests {
         format!("{}{}", &CARRY[..start], &CARRY[end..])
     }
 
+    fn with_only_marker(uuid: &str) -> String {
+        let mut content = CARRY.to_owned();
+        let mut ranges = find_block_starts(CARRY, "no_connect")
+            .into_iter()
+            .filter_map(|start| find_balanced_block(CARRY, start))
+            .filter(|&(start, end)| !CARRY[start..end].contains(uuid))
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|&(start, _)| std::cmp::Reverse(start));
+        for (start, end) in ranges {
+            content.replace_range(start..end, "");
+        }
+        content
+    }
+
     #[test]
     fn a_sheet_no_placement_change_touched_carries_nothing() {
         let carries = plan_no_connect_carry(&tree(CARRY), &tree(CARRY)).expect("nothing refuses");
         assert!(carries.is_empty(), "{carries:?}");
+    }
+
+    #[test]
+    fn replacement_matches_a_moved_pin_by_uuid_unit_and_number() {
+        let before = with_only_marker(R2_MARKER);
+        let after = before.replacen("(at 0 3.81 270)", "(at -3.81 0 0)", 1);
+        assert_ne!(after, before);
+
+        let placement_error = plan_no_connect_carry(&tree(&before), &tree(&after))
+            .expect_err("ordinary placement identity includes unchanged local geometry");
+        let NoConnectCarryError::Unmappable { .. } = placement_error else {
+            panic!("expected an unmappable placement refusal: {placement_error:?}");
+        };
+
+        let carries = plan_no_connect_carry_for_replacement(&tree(&before), &tree(&after))
+            .expect("replacement preserves the one symbol/unit/pin-number identity");
+        let carry = carries
+            .iter()
+            .find(|carry| carry.uuid == R2_MARKER)
+            .expect("R2's marker follows pin 1");
+        assert_eq!(carry.from, (158.75, 156.21));
+        assert_eq!(carry.to, (154.94, 160.02));
+    }
+
+    #[test]
+    fn replacement_refuses_a_renumbered_protected_pin() {
+        let before = with_only_marker(R2_MARKER);
+        let after = before.replacen("(number \"1\"", "(number \"3\"", 1);
+        assert_ne!(after, before);
+        let error = plan_no_connect_carry_for_replacement(&tree(&before), &tree(&after))
+            .expect_err("pin 1 has no one-to-one arrival after renumbering");
+        let NoConnectCarryError::Unmappable { reason } = error else {
+            panic!("expected an unmappable replacement refusal: {error:?}");
+        };
+        assert!(reason.contains(R2_MARKER), "{reason}");
+        assert!(reason.contains("0 matching pins"), "{reason}");
+    }
+
+    #[test]
+    fn replacement_refuses_a_duplicated_protected_pin_number() {
+        let before = with_only_marker(R2_MARKER);
+        let (start, end) = find_block_starts(&before, "pin")
+            .into_iter()
+            .find_map(|start| find_balanced_block(&before, start))
+            .expect("the fixture embeds a pin block");
+        let duplicate = before[start..end].to_owned();
+        let mut after = before.clone();
+        after.insert_str(end, &duplicate);
+
+        let error = plan_no_connect_carry_for_replacement(&tree(&before), &tree(&after))
+            .expect_err("two arrivals for one protected pin are ambiguous");
+        let NoConnectCarryError::Unmappable { reason } = error else {
+            panic!("expected an unmappable replacement refusal: {error:?}");
+        };
+        assert!(reason.contains(R2_MARKER), "{reason}");
+        assert!(reason.contains("2 matching pins"), "{reason}");
     }
 
     #[test]

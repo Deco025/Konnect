@@ -3,6 +3,28 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: component replacement preserves pin junction and no-connect intent
+
+`replace_component` previously changed a placed symbol's library identity and
+reported success without re-evaluating the junction dots at its old and new
+pin endpoints. A replacement whose new pin landed on a wire could therefore
+look connected while remaining absent from KiCad's netlist; a pin that left a
+wire could strand an unjustified dot.
+
+Replacement now reconciles the whole old/new pin-endpoint difference and
+commits the symbol, carried no-connect markers, and junction changes in one
+conditional atomic write. A no-connect marker follows a protected pin only
+when the old pin maps to exactly one new pin with the same placed-symbol UUID,
+unit, and pin number. Local geometry is intentionally allowed to change;
+removed, renumbered, or duplicated protected pins return a structured refusal
+before writing instead of guessing correspondence.
+
+The response gains `junctions_added_count`, `junctions_pruned_count`,
+`no_connects_moved_count`, and `no_connects_moved`. Existing component fields
+are now bound to the selected UUIDs and read back from the committed file. An
+unprovable committed result returns `mutation_outcome_uncertain` rather than
+echoing the requested library identifier as proof.
+
 ## Unreleased: region moves preserve pin junction and no-connect intent
 
 `move_region` previously translated every selected symbol unit and reported a
@@ -110,10 +132,10 @@ A placement change that carries nothing reports `0` and `[]`. No existing field
 changes meaning, and `junctions_added_count` on a move or bulk shift can now be
 `0` where it was `1`, which is the fix.
 
-`move_region` now inherits this contract together with whole-region junction
-reconciliation as documented above (#623). `replace_component` still
-reconciles no junctions (#625). `batch_place_components` now reconciles its
-newly placed pins as documented above (#622).
+`move_region` and `replace_component` now inherit this contract together with
+their whole-mutation junction reconciliation as documented above (#623,
+#625). `batch_place_components` reconciles its newly placed pins as documented
+above (#622).
 
 A placement change that cannot follow a marker one-to-one now **refuses before
 writing** instead of orphaning it:

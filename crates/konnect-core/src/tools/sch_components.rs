@@ -12,7 +12,11 @@ use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, opt_u32, reembed_lib_symbols,
     require_array, require_f64, require_str,
-    sch_wiring::{carry_no_connects, observed_no_connect_moves, reconcile_junctions_for_placement},
+    sch_wiring::{
+        apply_no_connect_carries, carry_no_connects, no_connect_carry_unwritable,
+        observed_no_connect_moves, plan_no_connect_carry_for_replacement,
+        reconcile_junctions_for_placement,
+    },
     ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
@@ -379,7 +383,13 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "replace_component",
-            "Replace every placed unit of a component with a new library symbol while preserving unit numbers. A unit override is accepted only for a single placement.",
+            "Replace every placed unit of a component with a new library symbol while \
+             preserving unit numbers. A unit override is accepted only for a single \
+             placement. Junction dots are re-judged once for the whole replacement, \
+             reported as junctions_pruned_count and junctions_added_count. A no-connect \
+             flag follows the same symbol UUID, unit, and pin number when that mapping is \
+             one-to-one; removed, renumbered, or duplicated protected pins refuse before \
+             writing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -4179,7 +4189,6 @@ async fn handle_replace_component(
             blocks.len()
         )));
     }
-
     let parsed = parse_sexp(&content)?;
     let current_units: Vec<u32> = extract_symbol_instances(&parsed)
         .into_iter()
@@ -4190,6 +4199,14 @@ async fn handle_replace_component(
     let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
         Ok(source) => source,
         Err(error) => return Ok(error.into_tool_result()),
+    };
+    // Preserve the ownership preflight as the first semantic gate. Binding the
+    // selected instances is still performed before any in-memory mutation,
+    // but an ambiguously owned sheet must report that conflict rather than a
+    // secondary instance-metadata diagnosis.
+    let mut target = match component_target_from_source(&sch_path, &content, &reference) {
+        Ok(target) => target,
+        Err(error) => return Ok(error.into_result()),
     };
     let embedded_unit_count = parsed
         .find("lib_symbols")
@@ -4296,15 +4313,63 @@ async fn handle_replace_component(
     if !super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id, &src) {
         return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id, &src));
     }
+
+    // A replacement changes pin geometry while preserving only symbol UUID,
+    // unit and pin number. Carry a marker through that narrower, explicitly
+    // one-to-one identity before the junction pass sees the new endpoints;
+    // removed, renumbered or duplicated protected pins refuse before writing.
+    let after_tree = parse_sexp(&content)?;
+    let carries = match plan_no_connect_carry_for_replacement(&parsed, &after_tree) {
+        Ok(carries) => carries,
+        Err(error) => return Ok(error.into_result(&sch_path)),
+    };
+    content = match apply_no_connect_carries(content, &carries) {
+        Some(content) => content,
+        None => return Ok(no_connect_carry_unwritable(&sch_path)),
+    };
+    let (content, added, pruned) = reconcile_junctions_for_placement(&expected, content);
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
-    Ok(CallToolResult::json(&json!({
-        "reference": reference,
+    let moved_markers = match observed_no_connect_moves(&sch_path, "replace_component", &carries)? {
+        Ok(moved) => moved,
+        Err(error) => return Ok(error),
+    };
+    for unit in &mut target.units {
+        unit.lib_id.clone_from(&new_lib_id);
+        if let Some(new_unit) = new_unit {
+            unit.unit = new_unit;
+        }
+    }
+    let observed = match load_component_mutation_readback(&sch_path, &target) {
+        Ok(Ok(observed)) => observed,
+        Ok(Err(error)) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "replace_component",
+                tool_error_summary(&error),
+            ));
+        }
+        Err(error) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "replace_component",
+                format!("the written schematic cannot be read back: {error}"),
+            ));
+        }
+    };
+    let mut result = json!({
+        "reference": observed["reference"],
         "old_lib_id": old_lib_id,
-        "new_lib_id": new_lib_id,
+        "new_lib_id": observed["lib_id"],
         "unit": new_unit,
-        "units_replaced": blocks.len()
-    })))
+        "units_replaced": observed["unit_count"],
+        "junctions_added_count": added,
+        "junctions_pruned_count": pruned,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers
+    });
+    copy_component_observation(&mut result, &observed);
+    Ok(CallToolResult::json(&result))
 }
 
 // Library symbol resolution moved to tools/mod.rs (shared with sch_wiring.rs)
