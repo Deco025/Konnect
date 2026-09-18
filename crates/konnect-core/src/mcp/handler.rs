@@ -1063,6 +1063,81 @@ mod active_layer_dispatch_tests {
 }
 
 #[cfg(test)]
+mod current_board_template_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn create_project_board_is_refused_by_add_net_without_writing() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+
+        let create = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 631,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_project",
+                    "arguments": {
+                        "path": dir.path().display().to_string(),
+                        "name": "current"
+                    }
+                }
+            }))
+            .await
+            .expect("create_project returns a response");
+        let create_result = create.result.expect("JSON-RPC tool result");
+        assert_ne!(create_result["isError"], true, "{create_result}");
+
+        let board = dir.path().join("current.kicad_pcb");
+        let original = std::fs::read(&board).expect("created board");
+        let original_text = std::str::from_utf8(&original).unwrap();
+        assert!(original_text.contains("(version 20260206)"));
+        assert!(!original_text.contains("\n\t(net "));
+
+        let add_net = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 632,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_net",
+                    "arguments": {
+                        "board": board.display().to_string(),
+                        "net_name": "PROBE_NET"
+                    }
+                }
+            }))
+            .await
+            .expect("add_net returns a response");
+        let add_net_result = add_net.result.expect("JSON-RPC tool result");
+        assert_eq!(add_net_result["isError"], true, "{add_net_result}");
+        assert!(
+            add_net_result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("KiCad 10")),
+            "{add_net_result}"
+        );
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            original,
+            "the refused operation must not change the generated board"
+        );
+    }
+}
+
+#[cfg(test)]
 mod annotate_dispatch_tests {
     use super::*;
     use crate::tools::ServerConfig;
