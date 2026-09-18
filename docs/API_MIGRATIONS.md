@@ -3,6 +3,37 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a stale-target refusal is bounded, not one line per symbol (patch release)
+
+Every mutating schematic tool preflights placed-symbol instance metadata. When
+that check refused, `error.reason` carried one `"{reference}: observed [...],
+expected [...]"` line per stale symbol. A sheet goes stale as a whole — copy a
+`.kicad_sch` to a new filename stem and every symbol records the old project
+name — so the answer repeated one fact once per symbol: 18 535 B of `reason` and
+a 37 301 B response for a 46-symbol sheet, growing linearly with the sheet (#592).
+
+`reason` now names the expected instance identity once, states how many of the
+sheet's placed symbols are stale, and groups the symbols by their diagnosis,
+naming at most three symbols and five distinct diagnoses before counting the
+rest. Instance lists themselves are never sampled — an elided path is one the
+caller cannot write back:
+
+```text
+placed-symbol instance metadata disagrees with project 'demo': 46 of 46 placed
+symbols are stale; every symbol must record exactly [demo:/<root>/<sheet>];
+RV201, C201, R203 and 43 more (46 symbols): observed [old:/<root>/<sheet>]
+```
+
+The same sheet now answers in 1 373 B. Symbols that disagree with each other
+keep separate entries, so a mixed sheet still names each distinct failure.
+
+The guard itself is unchanged: the same documents are refused, `error.kind`
+stays `stale_target`, `error.target` is unchanged, and nothing is written. Only
+the `reason` text — and the `message` that interpolates it — is shorter. Callers
+matching on `error.kind` need no change; a caller parsing individual symbols out
+of `reason` should read the sampled identities and counts instead, or inspect
+the file. `reason` remains prose for a human or a model, not a parsed field.
+
 ## Unreleased: explicit live-board synchronization for CLI DRC
 
 `run_drc` and `get_drc_violations` accept `sync_live_board: false` and
