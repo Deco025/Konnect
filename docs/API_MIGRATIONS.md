@@ -3,6 +3,34 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: region moves preserve pin junction and no-connect intent
+
+`move_region` previously translated every selected symbol unit and reported a
+successful placement without re-evaluating the junction dots at any moved pin.
+A pin moved onto the interior of a wire therefore looked connected in
+eeschema but remained unconnected in KiCad's netlist; a pin moved away left an
+unjustified dot behind. No-connect markers were also left at their old
+coordinates.
+
+Region movement now treats the selected units as one placement change. It
+carries no-connect markers by stable pin identity, reconciles the whole-sheet
+symmetric pin-endpoint difference once, and commits symbols, markers, and
+junctions in one conditional atomic write. Whole-region reconciliation is
+important when selected pins swap coordinates: processing the symbols one at
+a time could briefly invent or remove a dot that remains justified by the
+complete move.
+
+The response gains `junctions_added_count`, `junctions_pruned_count`,
+`no_connects_moved_count`, and `no_connects_moved`. Returned placements are
+read back from the committed file. If a marker cannot be followed one-to-one,
+the tool returns a structured `ambiguous_target` or `stale_target` error and
+leaves the schematic byte-identical. If committed readback cannot prove the
+selected UUIDs landed at their requested positions, the tool reports
+`mutation_outcome_uncertain` rather than echoing its plan as success.
+
+The tool still moves symbols only; it does not stretch or reroute connected
+wires. Re-route the affected nets after a successful region move.
+
 ## Unreleased: batch placement preserves pin-on-wire connectivity
 
 `batch_place_components` previously placed a pin directly on the interior of
@@ -82,10 +110,10 @@ A placement change that carries nothing reports `0` and `[]`. No existing field
 changes meaning, and `junctions_added_count` on a move or bulk shift can now be
 `0` where it was `1`, which is the fix.
 
-`move_region` and `replace_component` reconcile no junctions at all yet (#623,
-#625) and are unchanged here; they inherit this contract when they gain
-reconciliation. `batch_place_components` now reconciles its newly placed pins
-as documented above (#622).
+`move_region` now inherits this contract together with whole-region junction
+reconciliation as documented above (#623). `replace_component` still
+reconciles no junctions (#625). `batch_place_components` now reconciles its
+newly placed pins as documented above (#622).
 
 A placement change that cannot follow a marker one-to-one now **refuses before
 writing** instead of orphaning it:

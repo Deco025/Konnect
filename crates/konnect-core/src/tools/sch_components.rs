@@ -246,7 +246,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_region",
-            "Move all symbols within a bounding box by a given offset.",
+            "Move all symbol units whose origins are within a bounding box by a given offset. \
+             Does NOT adjust connected wires. Junction dots are re-judged once for the whole \
+             region where its pins moved, reported as junctions_pruned_count and \
+             junctions_added_count. No-connect flags travel with the pins they protect, \
+             reported as no_connects_moved; the move is refused before writing when a pin \
+             cannot be followed one-to-one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -3401,7 +3406,8 @@ async fn handle_move_region(
         Err(e) => return Ok(e),
     };
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
+    let before_source = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
 
     // Select placements by UUID, not reference. A multi-unit reference may
     // have one unit inside the rectangle and another outside; resolving the
@@ -3414,33 +3420,98 @@ async fn handle_move_region(
         .map(|symbol| symbol.uuid.clone())
         .collect();
 
-    let mut moved_references = Vec::new();
-    let mut placements = Vec::new();
+    let mut moved_uuids = Vec::new();
+    let mut expected_positions = BTreeMap::new();
     for symbol in sch.symbols.iter_mut() {
         if uuids_to_move.contains(&symbol.uuid) {
             let (old_x, old_y) = symbol.position();
             let (new_x, new_y) = snap_point(old_x + dx, old_y + dy, 1.27);
             symbol.move_to(new_x, new_y);
-            let reference = symbol.reference().unwrap_or("?").to_string();
-            if !moved_references.contains(&reference) {
-                moved_references.push(reference.clone());
-            }
-            placements.push(json!({
-                "reference": reference,
-                "unit": symbol.unit,
-                "x": new_x,
-                "y": new_y
-            }));
+            moved_uuids.push(symbol.uuid.clone());
+            expected_positions.insert(symbol.uuid.clone(), (new_x, new_y));
         }
     }
 
-    sch.overwrite()?;
+    // Region movement is one placement change, not a series of independent
+    // moves. Carry marker intent and reconcile the whole-sheet symmetric pin
+    // difference once so pins that swap coordinates do not manufacture or
+    // remove a junction between the per-symbol steps (#623, #626).
+    let carried = match carry_no_connects(&sch_path, &before_source, &mut sch) {
+        Ok(carried) => carried,
+        Err(error) => return Ok(error),
+    };
+    let candidate = sch.to_source();
+    let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
+    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+
+    let moved_markers = match observed_no_connect_moves(&sch_path, "move_region", &carried)? {
+        Ok(moved) => moved,
+        Err(error) => return Ok(error),
+    };
+
+    // Planned coordinates are not proof that the committed file contains the
+    // move. Bind the response back to the selected UUIDs and reject an
+    // incomplete or divergent readback as uncertain after mutation.
+    let committed = match cse::Schematic::load(&sch_path) {
+        Ok(committed) => committed,
+        Err(error) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "move_region",
+                format!("the written schematic cannot be read back: {error}"),
+            ));
+        }
+    };
+    let mut moved_references = Vec::new();
+    let mut placements = Vec::new();
+    for uuid in &moved_uuids {
+        let Some(symbol) = committed.symbols.iter().find(|symbol| symbol.uuid == *uuid) else {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "move_region",
+                format!("selected symbol UUID {uuid} is missing from the written schematic"),
+            ));
+        };
+        let (observed_x, observed_y) = symbol.position();
+        let &(expected_x, expected_y) = expected_positions
+            .get(uuid)
+            .expect("every selected UUID has a planned position");
+        if !konnect_sexp::geometry::points_coincident(
+            observed_x,
+            observed_y,
+            expected_x,
+            expected_y,
+            crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+        ) {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "move_region",
+                format!(
+                    "selected symbol UUID {uuid} was written at ({observed_x}, {observed_y}), expected ({expected_x}, {expected_y})"
+                ),
+            ));
+        }
+        let reference = symbol.reference().unwrap_or("?").to_string();
+        if !moved_references.contains(&reference) {
+            moved_references.push(reference.clone());
+        }
+        placements.push(json!({
+            "reference": reference,
+            "unit": symbol.unit,
+            "x": observed_x,
+            "y": observed_y
+        }));
+    }
 
     Ok(CallToolResult::json(&json!({
         "moved_count": moved_references.len(),
         "moved": moved_references,
         "moved_unit_count": placements.len(),
-        "placements": placements
+        "placements": placements,
+        "junctions_added_count": added,
+        "junctions_pruned_count": pruned,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers
     })))
 }
 
@@ -6450,6 +6521,40 @@ mod no_connect_carry_tests {
     }
 
     #[tokio::test]
+    async fn a_region_move_carries_the_marker_in_the_same_atomic_write() {
+        let (_directory, path) = fixture();
+        let result = handle_move_region(
+            &json!({
+                "schematic": path,
+                "x1": 158.0, "y1": 159.0,
+                "x2": 159.0, "y2": 161.0,
+                "dx": -3.81, "dy": 3.81
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+
+        assert_eq!(response["moved"], json!(["R2"]), "{response}");
+        assert_eq!(response["no_connects_moved_count"], 1, "{response}");
+        assert_eq!(
+            response["no_connects_moved"][0]["uuid"], R2_MARKER,
+            "{response}"
+        );
+        assert_eq!(
+            response["no_connects_moved"][0]["to"],
+            json!({ "x": 154.94, "y": 160.02 }),
+            "{response}"
+        );
+        assert_eq!(response["junctions_added_count"], 0, "{response}");
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(marker_at(&committed, R2_MARKER), (154.94, 160.02));
+        assert!(!has_junction(&committed, 154.94, 160.02));
+    }
+
+    #[tokio::test]
     async fn a_turn_carries_the_marker_the_same_way_a_move_does() {
         let (_directory, path) = fixture();
         let result = handle_rotate_schematic_component(
@@ -6546,6 +6651,32 @@ mod no_connect_carry_tests {
                 "refusing {reference} must leave the file byte-identical"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_region_carry_refuses_before_writing() {
+        let (_directory, path) = fixture();
+        let before = std::fs::read(&path).unwrap();
+        let result = handle_move_region(
+            &json!({
+                "schematic": path,
+                "x1": 113.0, "y1": 100.0,
+                "x2": 115.0, "y2": 103.0,
+                "dx": -12.7, "dy": 0.0
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result),
+            Some("ambiguous_target".to_string()),
+            "{:?}",
+            body(&result)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
