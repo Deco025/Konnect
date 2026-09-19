@@ -341,6 +341,56 @@ fn ensure_source_root_uuid(source: &str) -> anyhow::Result<(String, String)> {
     Ok((updated, uuid))
 }
 
+/// Ensure the root schematic carries the canonical hierarchy footer KiCad
+/// writes for a page-one root.  Without these records Eeschema repairs the
+/// file on open, even when every hierarchical sheet block is otherwise valid.
+fn ensure_hierarchy_root_footer(source: &str) -> anyhow::Result<String> {
+    fn direct_child(source: &str, wanted: &str) -> Option<(usize, usize)> {
+        konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch")
+            .into_iter()
+            .find(|(start, end)| {
+                parse_sexp(&source[*start..*end])
+                    .ok()
+                    .and_then(|node| node.head().map(str::to_owned))
+                    .as_deref()
+                    == Some(wanted)
+            })
+    }
+
+    fn line_start(source: &str, offset: usize) -> usize {
+        source[..offset]
+            .rfind('\n')
+            .map_or(offset, |newline| newline + 1)
+    }
+
+    fn root_close_line(source: &str) -> anyhow::Result<usize> {
+        let root_start = konnect_sexp::writer::find_block_starts(source, "kicad_sch")
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("schematic has no kicad_sch root"))?;
+        let (_, root_end) = konnect_sexp::writer::find_balanced_block(source, root_start)
+            .ok_or_else(|| anyhow::anyhow!("schematic root is not balanced"))?;
+        Ok(line_start(source, root_end - 1))
+    }
+
+    let mut updated = source.to_owned();
+    if direct_child(&updated, "sheet_instances").is_none() {
+        let anchor = direct_child(&updated, "embedded_fonts")
+            .map(|(start, _)| line_start(&updated, start))
+            .map(Ok)
+            .unwrap_or_else(|| root_close_line(&updated))?;
+        updated.insert_str(
+            anchor,
+            "  (sheet_instances\n    (path \"/\"\n      (page \"1\")\n    )\n  )\n",
+        );
+    }
+    if direct_child(&updated, "embedded_fonts").is_none() {
+        let anchor = root_close_line(&updated)?;
+        updated.insert_str(anchor, "  (embedded_fonts no)\n");
+    }
+    Ok(updated)
+}
+
 /// Give every item in a duplicated document its own UUID.
 ///
 /// `duplicate_sheet` rewrote only the root `(uuid ...)`. Every nested item —
@@ -689,6 +739,7 @@ async fn handle_add_hierarchical_sheet(
     }
     let page = next_free_page(&parent, &project_name).to_string();
     let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
+    let parent_base = ensure_hierarchy_root_footer(&parent_base)?;
     let root_path = format!("/{root_uuid}");
     let block = format_hierarchical_sheet(HierarchicalSheetSpec {
         name: &sheet_name,
@@ -1012,6 +1063,7 @@ async fn handle_duplicate_sheet(
     const DUPLICATE_OFFSET_MM: f64 = 20.0;
     let page = next_free_page(&parent, &project_name).to_string();
     let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
+    let parent_base = ensure_hierarchy_root_footer(&parent_base)?;
     let root_path = format!("/{root_uuid}");
     let block = format_hierarchical_sheet(HierarchicalSheetSpec {
         name: &new_name,
@@ -1716,6 +1768,35 @@ mod tests {
             parent.sheets.by_name("Power Supply").unwrap().page("root"),
             Some("2")
         );
+        let source = std::fs::read_to_string(&root).unwrap();
+        let tree = parse_sexp(&source).unwrap();
+        let root_instance = tree
+            .find("sheet_instances")
+            .and_then(|instances| instances.find("path"))
+            .expect("a hierarchical root needs its canonical page-1 instance");
+        assert_eq!(
+            root_instance.get(1).and_then(|value| value.as_str()),
+            Some("/")
+        );
+        assert_eq!(
+            root_instance
+                .find("page")
+                .and_then(|page| page.get(1))
+                .and_then(|value| value.as_str()),
+            Some("1")
+        );
+        assert_eq!(tree.find_str("embedded_fonts"), Some("no"));
+    }
+
+    #[test]
+    fn hierarchy_root_footer_is_idempotent() {
+        let source = crate::tools::blank_schematic_template();
+        let once = ensure_hierarchy_root_footer(&source).unwrap();
+        let twice = ensure_hierarchy_root_footer(&once).unwrap();
+
+        assert_eq!(twice, once, "existing footer records must be preserved");
+        assert_eq!(once.matches("(sheet_instances").count(), 1);
+        assert_eq!(once.matches("(embedded_fonts no)").count(), 1);
     }
 
     fn result_json(result: &CallToolResult) -> Value {

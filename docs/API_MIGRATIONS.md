@@ -3,6 +3,18 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: hierarchical sheets open without KiCad repair (patch release)
+
+`add_hierarchical_sheet` and `duplicate_sheet` previously omitted canonical
+KiCad 10 sheet defaults and the root schematic's page-one instance/footer
+records. CLI ERC and PDF export still succeeded, but opening the generated root
+in Eeschema displayed an automatic-repair warning and changed the file on save.
+
+New and duplicated sheets now carry the defaults observed in a real KiCad
+10.0.6 repaired-save, and a hierarchy root gains `sheet_instances` and
+`embedded_fonts` only when those records are absent. Existing footer records
+are preserved. Callers do not need to change their requests.
+
 ## Unreleased: `place_decoupling_caps` requires exact references
 
 `place_decoupling_caps` no longer discovers capacitors by looking for any net
