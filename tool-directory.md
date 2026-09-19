@@ -309,7 +309,7 @@ and Windows servers do not.
 | `place_decoupling_caps` | Plan (dry-run default) or apply a row of decoupling caps beside an IC, from `capacitor_references` the caller supplies — never discovered by shared nets, since GND alone pairs a cap with nearly every IC on the board. Reports a blocked plan status naming why it can't apply (a target outside the board outline, or no score improvement) before anything is written. |
 | `plan_bga_fanout` | Plan a BGA fanout with the pitch detected from the pad grid: dogbone or inline vias for inner pads, stub traces, conservative via sizes. Apply executes the whole plan as one KiCad undo commit over live IPC. |
 | `auto_place_from_schematic` | Deterministic first placement: net-clustered groups laid out as grids inside the outline, courtyards non-overlapping; explicitly a starting point, with before/after scores in the response. |
-| `refine_placement_force_directed` | Deterministic spring embedder: shared nets pull (power 3x, differential pairs 5x), courtyards repel, edges constrain, collisions resolved on a snap grid. Same input, same plan — no randomness, no clocks. Locked references never move. |
+| `refine_placement_force_directed` | **Deprecated:** diagnostic deterministic spring embedder, not a recommended bulk-placement workflow. Dry-run reports applicability and displacement; non-converged, non-improving, hard-fail, off-board, unbounded, or over-limit plans cannot apply. |
 
 ---
 
