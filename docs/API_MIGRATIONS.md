@@ -3,6 +3,25 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `place_decoupling_caps` requires exact references
+
+`place_decoupling_caps` no longer discovers capacitors by looking for any net
+shared with the target IC. A board-wide net such as GND made that inference
+select unrelated parts and could generate a row far outside the board.
+
+Callers must now supply a non-empty `capacitor_references` array containing the
+exact existing footprints to move. Those references are trusted as the
+caller's design intent; Konnect does not apply a reference-prefix or value
+heuristic to second-guess them. Missing, duplicate, unknown, or geometrically
+unplaceable references return structured invalid input before planning.
+
+Dry runs now report `plan_status` (`applicable` or `blocked`) and
+`blocking_reasons`. A target outside the board outline, a non-improving score,
+or a newly introduced hard failure blocks the plan. Apply mode evaluates the
+same plan and returns a structured `plan_blocked` error with the same reasons
+before writing. Existing net-inference callers must choose the exact references
+from schematic evidence and pass them explicitly.
+
 ## Unreleased: component replacement preserves pin junction and no-connect intent
 
 `replace_component` previously changed a placed symbol's library identity and
