@@ -218,7 +218,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "rotate_schematic_component",
             "Set the lowest-numbered unit's absolute rotation and rotate every other placed \
-             unit by the same delta. Does NOT adjust connected wires. Junction dots are \
+             unit by the same delta. Does NOT adjust connected wires. Each unit's \
+             Reference and Value text turns with its body, keeping any offset the caller \
+             gave it; use reset_schematic_field_positions to put fields back on their \
+             library anchors instead. Junction dots are \
              re-judged where the pins turned, reported as junctions_pruned_count and \
              junctions_added_count. A no-connect flag travels with the pin it protects, \
              reported as no_connects_moved; the turn is refused before writing when that \
@@ -8858,6 +8861,240 @@ mod multi_unit_component_tests {
             .as_str()
             .unwrap()
             .contains("may have changed"));
+    }
+}
+
+/// A field's `(at …)` is an absolute sheet coordinate, not an offset from the
+/// body, so a turn owes each field the same rotation it gives the symbol
+/// (#612).
+///
+/// Every case runs on `rotate_fields_kicad10.kicad_sch`, which is KiCad
+/// 10.0.6's own serialization — see its README for provenance and for the
+/// `kicad-cli sch export svg` anchors these expectations come from.
+///
+/// The sheet is built in twins: a symbol placed unrotated, and the same
+/// symbol placed at 90° outright `TWIN_OFFSET_MM` below it. Turning the first
+/// must land its fields exactly on the second's, less that offset — an
+/// expectation KiCad wrote into the fixture, not one this crate computed.
+#[cfg(test)]
+mod rotate_field_text_tests {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/rotate_fields_kicad10.kicad_sch");
+
+    /// How far below its unrotated twin each pre-rotated symbol sits.
+    const TWIN_OFFSET_MM: f64 = 25.4;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rotate-fields.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    async fn rotate(path: &std::path::Path, reference: &str, rotation: f64) -> CallToolResult {
+        handle_rotate_schematic_component(
+            &json!({ "schematic": path, "reference": reference, "rotation": rotation }),
+            &context(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Sheet position and stored angle of a symbol's Reference and Value text.
+    /// The angle comes back because the turn must leave it alone: KiCad adds
+    /// the symbol's rotation when it draws, so turning the stored angle here
+    /// would draw the text at twice the angle.
+    fn field_positions(source: &str, reference: &str) -> [(f64, f64, f64); 2] {
+        let schematic =
+            cse::Schematic::from_source(std::path::Path::new("sheet"), source.to_string())
+                .expect("fixture parses");
+        let symbol = schematic
+            .symbols
+            .iter()
+            .find(|symbol| symbol.reference() == Some(reference))
+            .expect("placed symbol");
+        ["Reference", "Value"].map(|name| {
+            let at = symbol
+                .properties
+                .iter()
+                .find(|property| property.name == name)
+                .expect("field")
+                .sub_nodes
+                .iter()
+                .find_map(cse::types::At::from_sexp)
+                .expect("field position");
+            (at.x, at.y, at.rotation.unwrap_or(0.0))
+        })
+    }
+
+    /// The fields of `twin`, lifted by the offset that separates the two
+    /// placements — where `reference`'s fields have to land once it turns.
+    fn twin_target(reference_twin: &str) -> [(f64, f64, f64); 2] {
+        field_positions(SHEET, reference_twin).map(|(x, y, angle)| (x, y - TWIN_OFFSET_MM, angle))
+    }
+
+    /// KiCad writes these coordinates to four decimals. Compare on that scale,
+    /// so the last bit of the twin subtraction does not decide a geometric
+    /// claim — 50.8 and 50.800000000000004 are the same point on a sheet.
+    fn to_nanometres(fields: [(f64, f64, f64); 2]) -> [(i64, i64, i64); 2] {
+        fields.map(|(x, y, angle)| {
+            (
+                (x * 1_000_000.0).round() as i64,
+                (y * 1_000_000.0).round() as i64,
+                (angle * 1_000_000.0).round() as i64,
+            )
+        })
+    }
+
+    /// Turning a placed symbol used to leave its field text where the body had
+    /// been. A `Device:LED` turned to 90° kept its Reference 2.54mm above the
+    /// origin — the middle of the now-vertical body, under the wire into its
+    /// anode.
+    ///
+    /// D2 is the same LED, placed at 90° outright, so the fixture carries the
+    /// answer. The literal is stated too, so the two agreeing on a wrong point
+    /// would still fail.
+    #[tokio::test]
+    async fn turning_a_symbol_carries_its_field_text_around() {
+        let (_directory, path) = fixture();
+
+        assert!(!rotate(&path, "D1", 90.0).await.is_error);
+
+        let turned = field_positions(&std::fs::read_to_string(&path).unwrap(), "D1");
+        // 2.54mm above the origin becomes 2.54mm to its left, clearing the
+        // vertical body instead of lying along it.
+        assert_eq!(turned, [(99.06, 50.8, 0.0), (104.14, 50.8, 0.0)]);
+        assert_eq!(to_nanometres(turned), to_nanometres(twin_target("D2")));
+    }
+
+    /// A placement rotates before it mirrors, and a reflection reverses the
+    /// sense of any rotation conjugated by it, so a mirrored body turns its
+    /// fields the other way. The case needs an anchor off both axes — a
+    /// `Device:LED`'s anchors are symmetric about the origin, so the reversal
+    /// only swaps the two fields and lands on the same pair of points.
+    #[tokio::test]
+    async fn turning_a_mirrored_symbol_turns_its_fields_the_other_way() {
+        let (_directory, path) = fixture();
+
+        assert!(!rotate(&path, "U1", 90.0).await.is_error);
+
+        let turned = field_positions(&std::fs::read_to_string(&path).unwrap(), "U1");
+        assert_eq!(turned[0], (133.985, 45.72, 0.0));
+        assert_eq!(to_nanometres(turned), to_nanometres(twin_target("U2")));
+    }
+
+    /// The same part, same turn, no mirror: the Reference lands on the other
+    /// side of the body. This is the control that makes the case above bite —
+    /// ignore the reflection and the mirrored symbol lands here instead.
+    #[tokio::test]
+    async fn turning_an_unmirrored_symbol_turns_its_fields_the_plain_way() {
+        let (_directory, path) = fixture();
+
+        assert!(!rotate(&path, "U3", 90.0).await.is_error);
+
+        let turned = field_positions(&std::fs::read_to_string(&path).unwrap(), "U3");
+        assert_eq!(turned[0], (172.085, 55.88, 0.0));
+        assert_eq!(to_nanometres(turned), to_nanometres(twin_target("U4")));
+        assert_ne!(
+            turned[0].1 - 50.8,
+            twin_target("U2")[0].1 - 50.8,
+            "the mirrored and unmirrored turns must not agree, or neither case proves the parity"
+        );
+    }
+
+    /// The turn carries a field the caller positioned by hand as readily as
+    /// one still on its library anchor: the offset turns, it is not reset.
+    /// `reset_schematic_field_positions` is the tool that discards a manual
+    /// offset, and it must stay the only one. D3's Reference was dragged to
+    /// 10mm right and 10mm up of its origin before the resave.
+    #[tokio::test]
+    async fn turning_a_symbol_carries_a_hand_placed_field_offset_round() {
+        let (_directory, path) = fixture();
+        assert_eq!(field_positions(SHEET, "D3")[0], (111.6, 91.6, 0.0));
+
+        assert!(!rotate(&path, "D3", 90.0).await.is_error);
+
+        // (10, -10) from the origin, turned a quarter: (-10, -10).
+        assert_eq!(
+            field_positions(&std::fs::read_to_string(&path).unwrap(), "D3")[0],
+            (91.6, 91.6, 0.0)
+        );
+    }
+
+    /// A full turn must land back where it started, with no drift accumulated
+    /// through the trigonometry — byte for byte, so a field angle nudged by a
+    /// quarter of a degree would show up too.
+    #[tokio::test]
+    async fn turning_a_symbol_the_whole_way_round_restores_the_sheet() {
+        let (_directory, path) = fixture();
+        // The first write reserializes KiCad's formatting into Konnect's, so
+        // the baseline is the sheet after a no-op turn, not the fixture bytes.
+        assert!(!rotate(&path, "D1", 0.0).await.is_error);
+        let baseline = std::fs::read_to_string(&path).unwrap();
+
+        for rotation in [90.0, 180.0, 270.0, 0.0] {
+            assert!(!rotate(&path, "D1", rotation).await.is_error);
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            baseline,
+            "a full turn must land back where it started, byte for byte"
+        );
+    }
+
+    /// One turn now does three things in the same mutation: it carries the
+    /// field text (#612), it reconciles the junctions the pins leave and reach
+    /// (#615), and it moves the no-connect flag with the pin it protects
+    /// (#626). R1 stands on the NETJ wire with a marker on pin 2; turned, pin
+    /// 1 lands mid-span and pin 2 swings clear of the wire's end.
+    ///
+    /// `kicad-cli sch export netlist` is the oracle for the connectivity half:
+    /// `/NETJ` carries `R2.1` before the turn and `R2.1, R1.1` after it.
+    #[tokio::test]
+    async fn one_turn_carries_fields_junctions_and_no_connects_together() {
+        let (_directory, path) = fixture();
+        // R1's Reference sits 2.032mm right of the origin at a stored 90°.
+        assert_eq!(field_positions(SHEET, "R1")[0], (103.632, 139.7, 90.0));
+
+        let response = body(&rotate(&path, "R1", 90.0).await);
+
+        assert_eq!(response["junctions_added_count"], 1);
+        assert_eq!(response["junctions_pruned_count"], 0);
+        assert_eq!(response["no_connects_moved_count"], 1);
+        // 2.032mm to the right becomes 2.032mm above, and the stored angle is
+        // untouched — the field carry did not skip a handler that reconciles.
+        assert_eq!(
+            field_positions(&std::fs::read_to_string(&path).unwrap(), "R1")[0],
+            (101.6, 137.668, 90.0)
+        );
     }
 }
 
