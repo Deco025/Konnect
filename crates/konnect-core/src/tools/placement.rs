@@ -27,7 +27,7 @@ mod plan_status;
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, with_board_ipc_classified, ToolContext, ToolDef};
+use crate::tools::{get_path, opt_positive_f64, with_board_ipc_classified, ToolContext, ToolDef};
 use konnect_sexp::board::{
     board_outline_bbox, footprint_courtyards, footprints, CourtyardSource, FootprintCourtyard,
     PcbConnectivityIndex, Side,
@@ -130,12 +130,15 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "refine_placement_force_directed",
-            "Refine placement with a deterministic spring embedder: shared nets pull \
+            "DEPRECATED: diagnose an existing deterministic spring-embedder plan; do not \
+             use this as a recommended bulk-placement workflow. Shared nets pull \
              connected parts together (power nets weighted 3x, differential pairs 5x), \
              courtyards repel, the board edge constrains. No randomness, no clocks: the \
              same input always yields the same plan, converging when the grid-snapped \
-             layout stops changing. Locked references exert force but never move. \
-             Dry-run by default; the response carries before/after scores.",
+             layout stops changing. A plan is blocked when it does not converge or improve, \
+             has a hard failure or off-board target, exceeds max_displacement_mm, or has no \
+             displacement limit. Blocked plans can be inspected in dry-run but cannot apply. \
+             Locked references exert force but never move. Dry-run by default.",
             json!({
                 "type": "object",
                 "properties": {
@@ -143,6 +146,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "references": { "type": "array", "items": { "type": "string" }, "description": "Components to refine (default: all)" },
                     "locked": { "type": "array", "items": { "type": "string" }, "description": "References that must not move" },
                     "iterations": { "type": "integer", "default": 300, "description": "Iteration ceiling" },
+                    "max_displacement_mm": { "type": "number", "exclusiveMinimum": 0, "description": "Required safety limit before apply; plans moving any footprint farther are blocked" },
                     "dry_run": { "type": "boolean", "default": true }
                 },
                 "required": ["board"]
@@ -1207,6 +1211,62 @@ fn net_weight(net: &str) -> f64 {
     }
 }
 
+#[derive(Debug)]
+struct ForceMoveSafety {
+    reference: String,
+    displacement_mm: f64,
+    inside_outline: bool,
+    target_anchor: (f64, f64),
+}
+
+fn force_directed_applicability(
+    max_displacement_mm: Option<f64>,
+    converged: bool,
+    iterations_run: usize,
+    score_before: i64,
+    score_after: i64,
+    verdict_after: &str,
+    moves: &[ForceMoveSafety],
+) -> PlanApplicability {
+    let mut applicability = PlanApplicability::new();
+    if max_displacement_mm.is_none() {
+        applicability
+            .block("max_displacement_mm is required before this deprecated planner can apply");
+    }
+    for planned in moves {
+        if max_displacement_mm.is_some_and(|limit| planned.displacement_mm > limit) {
+            let limit = max_displacement_mm.expect("checked as some");
+            applicability.block(format!(
+                "{} plans a {} mm displacement, exceeding max_displacement_mm {limit}",
+                planned.reference,
+                round3(planned.displacement_mm),
+            ));
+        }
+        if !planned.inside_outline {
+            applicability.block(format!(
+                "{} plans outside the board outline at ({}, {})",
+                planned.reference,
+                round3(planned.target_anchor.0),
+                round3(planned.target_anchor.1),
+            ));
+        }
+    }
+    if !converged {
+        applicability.block(format!(
+            "the plan did not converge within {iterations_run} iterations"
+        ));
+    }
+    if score_after <= score_before {
+        applicability.block(format!(
+            "the plan does not improve the score ({score_before} → {score_after})"
+        ));
+    }
+    if verdict_after == "hard_fail" {
+        applicability.block("the planned placement has a hard-fail verdict");
+    }
+    applicability
+}
+
 async fn handle_force_directed(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1214,6 +1274,10 @@ async fn handle_force_directed(
     let board = get_path(args, "board")?;
     let iterations = args["iterations"].as_u64().unwrap_or(300).min(10_000) as usize;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let max_displacement_mm = match opt_positive_f64(args, "max_displacement_mm") {
+        Ok(limit) => limit,
+        Err(error) => return Ok(error),
+    };
     let locked: BTreeSet<String> = args["locked"]
         .as_array()
         .map(|a| {
@@ -1429,6 +1493,7 @@ async fn handle_force_directed(
     // Final positions: snapped centers, translated back to root anchors.
     let mut placements = Vec::new();
     let mut planned_moves = Vec::new();
+    let mut move_safety = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         if !movable(i) {
             continue;
@@ -1440,19 +1505,35 @@ async fn handle_force_directed(
         }
         let (ax, ay) = part.at;
         let reference = part.reference.clone().expect("filtered");
+        let target_anchor = (
+            ((target.0 + (ax - bcx)) * 1e3).round() / 1e3,
+            ((target.1 + (ay - bcy)) * 1e3).round() / 1e3,
+        );
+        let displacement_mm = (target_anchor.0 - ax).hypot(target_anchor.1 - ay);
+        let inside_outline = !(target.0 - sizes[i].0 / 2.0 < ox0
+            || target.1 - sizes[i].1 / 2.0 < oy0
+            || target.0 + sizes[i].0 / 2.0 > ox1
+            || target.1 + sizes[i].1 / 2.0 > oy1);
+        move_safety.push(ForceMoveSafety {
+            reference: reference.clone(),
+            displacement_mm,
+            inside_outline,
+            target_anchor,
+        });
         placements.push(konnect_ipc::types::IpcFootprintPlacement {
             reference: reference.clone(),
-            x: ((target.0 + (ax - bcx)) * 1e3).round() / 1e3,
-            y: ((target.1 + (ay - bcy)) * 1e3).round() / 1e3,
+            x: target_anchor.0,
+            y: target_anchor.1,
             rotation: part.rotation_deg,
         });
         planned_moves.push(json!({
             "reference": reference,
             "from": { "x": round3(ax), "y": round3(ay) },
             "to": {
-                "x": round3(target.0 + (ax - bcx)),
-                "y": round3(target.1 + (ay - bcy)),
+                "x": round3(target_anchor.0),
+                "y": round3(target_anchor.1),
             },
+            "displacement_mm": round3(displacement_mm),
         }));
     }
 
@@ -1460,16 +1541,47 @@ async fn handle_force_directed(
     let planned_content = apply_placements_to_content(&content, &placements)?;
     let score_after = score_of_content(ctx, &planned_content).await?;
 
+    let (before_num, after_num) = (
+        score_before["score"].as_i64().unwrap_or(i64::MIN),
+        score_after["score"].as_i64().unwrap_or(i64::MIN),
+    );
+    let applicability = force_directed_applicability(
+        max_displacement_mm,
+        converged,
+        iterations_run,
+        before_num,
+        after_num,
+        score_after["verdict"].as_str().unwrap_or("unavailable"),
+        &move_safety,
+    );
+    let (plan_status, blocking_reasons) = applicability.to_json();
+
     if dry_run {
         return Ok(CallToolResult::json(&json!({
             "dry_run": true,
             "iterations_run": iterations_run,
             "converged": converged,
+            "plan_status": plan_status,
+            "blocking_reasons": blocking_reasons,
             "planned_moves": planned_moves,
             "score_before": score_before["score"],
             "score_after_plan": score_after["score"],
             "verdict_after_plan": score_after["verdict"],
         })));
+    }
+
+    if applicability.is_blocked() {
+        let reasons = applicability.blocking_reasons().to_vec();
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::PlanBlocked {
+                operation: "refine_placement_force_directed".into(),
+                reasons: reasons.clone(),
+            },
+            format!(
+                "refine_placement_force_directed refuses to apply a blocked plan: {}",
+                reasons.join("; ")
+            ),
+        ));
     }
 
     if let Some(refusal) = super::pcb_board::refuse_if_board_open_in_kicad(
@@ -1491,6 +1603,8 @@ async fn handle_force_directed(
         "dry_run": false,
         "iterations_run": iterations_run,
         "converged": converged,
+        "plan_status": plan_status,
+        "blocking_reasons": blocking_reasons,
         "applied_count": applied.len(),
         "score_before": score_before["score"],
         "score_after": score_written["score"],
@@ -3313,9 +3427,17 @@ mod tests {
         let board = fixture_copy(&dir);
         let before = std::fs::read(&board).unwrap();
         let (ctx, _server) = ctx_with_open_board(&board);
-        let result = handle_force_directed(&json!({"board": board, "dry_run": false}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_force_directed(
+            &json!({
+                "board": board,
+                "references": ["C1"],
+                "max_displacement_mm": 20.0,
+                "dry_run": false
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_error);
         assert!(result_text(&result).contains("refine_placement_force_directed"));
@@ -3330,9 +3452,17 @@ mod tests {
         std::fs::write(&other, "").unwrap();
         let before = std::fs::read(&board).unwrap();
         let (ctx, _server) = ctx_with_open_board(&other);
-        let result = handle_force_directed(&json!({"board": board, "dry_run": false}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_force_directed(
+            &json!({
+                "board": board,
+                "references": ["C1"],
+                "max_displacement_mm": 20.0,
+                "dry_run": false
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         assert!(!result.is_error, "{result:?}");
         assert_ne!(std::fs::read(&board).unwrap(), before);
@@ -3474,6 +3604,202 @@ mod tests {
             a["verdict_after_plan"], "hard_fail",
             "refinement must not create hard failures: {a}"
         );
+    }
+
+    #[test]
+    fn force_directed_applicability_names_every_blocking_condition() {
+        let applicability = force_directed_applicability(
+            Some(1.0),
+            false,
+            300,
+            70,
+            70,
+            "hard_fail",
+            &[ForceMoveSafety {
+                reference: "C1".into(),
+                displacement_mm: 12.5,
+                inside_outline: false,
+                target_anchor: (-1.0, 46.0),
+            }],
+        );
+        let reasons = applicability.blocking_reasons().join("\n");
+        for expected in [
+            "C1 plans a 12.5 mm displacement, exceeding max_displacement_mm 1",
+            "C1 plans outside the board outline at (-1, 46)",
+            "the plan did not converge within 300 iterations",
+            "the plan does not improve the score (70 → 70)",
+            "the planned placement has a hard-fail verdict",
+        ] {
+            assert!(
+                reasons.contains(expected),
+                "missing {expected:?}: {reasons}"
+            );
+        }
+    }
+
+    #[test]
+    fn force_directed_applicability_requires_a_displacement_limit() {
+        let applicability = force_directed_applicability(None, true, 12, 70, 85, "pass", &[]);
+        assert_eq!(
+            applicability.blocking_reasons(),
+            &["max_displacement_mm is required before this deprecated planner can apply"]
+        );
+    }
+
+    /// #597: the public MCP route must disclose why a force-directed plan is
+    /// blocked and refuse the matching apply before the first footprint write.
+    #[tokio::test]
+    async fn served_force_directed_block_is_structured_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let before = std::fs::read(&board).unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let call = |id, dry_run| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "refine_placement_force_directed",
+                    "arguments": {
+                        "board": board.to_string_lossy(),
+                        "iterations": 1,
+                        "dry_run": dry_run
+                    }
+                }
+            })
+        };
+
+        let dry_response = handler
+            .handle_message(call(597, true))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let dry_body: serde_json::Value =
+            serde_json::from_str(dry_response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(dry_response["isError"], json!(false), "{dry_body}");
+        assert_eq!(dry_body["plan_status"], "blocked", "{dry_body}");
+        let dry_reasons = dry_body["blocking_reasons"].clone();
+        assert!(
+            dry_reasons
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("did not converge")))),
+            "{dry_body}"
+        );
+        assert!(
+            dry_reasons
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("max_displacement_mm")))),
+            "{dry_body}"
+        );
+
+        let apply_response = handler
+            .handle_message(call(598, false))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let apply_body: serde_json::Value =
+            serde_json::from_str(apply_response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(apply_response["isError"], json!(true), "{apply_body}");
+        assert_eq!(apply_body["error"]["kind"], "plan_blocked", "{apply_body}");
+        assert_eq!(
+            apply_body["error"]["operation"],
+            "refine_placement_force_directed"
+        );
+        assert_eq!(apply_body["error"]["reasons"], dry_reasons);
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            before,
+            "a plan_blocked refusal must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_directed_blocks_a_move_over_the_declared_displacement_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_force_directed(
+            &json!({
+                "board": board.to_string_lossy(),
+                "iterations": 1,
+                "max_displacement_mm": 0.001,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.is_error,
+            "dry-run still returns the diagnostic plan"
+        );
+        let response = text_of(&result).await;
+        assert_eq!(response["plan_status"], "blocked", "{response}");
+        assert!(
+            response["blocking_reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("exceeding max_displacement_mm")))),
+            "{response}"
+        );
+        assert!(
+            response["planned_moves"]
+                .as_array()
+                .is_some_and(|moves| moves
+                    .iter()
+                    .all(|planned| planned["displacement_mm"].is_number())),
+            "{response}"
+        );
+    }
+
+    /// A bounded plan that settles and improves the shared placement score is
+    /// still usable; #597 retires unsafe bulk cleanup, not the public API.
+    #[tokio::test]
+    async fn force_directed_applicable_plan_still_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let dry_args = json!({
+            "board": board.to_string_lossy(),
+            "references": ["C1"],
+            "max_displacement_mm": 20.0,
+        });
+        let dry = text_of(&handle_force_directed(&dry_args, &test_ctx()).await.unwrap()).await;
+        assert_eq!(dry["plan_status"], "applicable", "{dry}");
+        assert!(dry["converged"].as_bool().is_some_and(|value| value));
+        assert!(dry["score_after_plan"].as_i64() > dry["score_before"].as_i64());
+
+        let result = handle_force_directed(
+            &json!({
+                "board": board.to_string_lossy(),
+                "references": ["C1"],
+                "max_displacement_mm": 20.0,
+                "dry_run": false,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let applied = text_of(&result).await;
+        assert_eq!(applied["plan_status"], "applicable", "{applied}");
+        assert_eq!(applied["applied_count"], 1, "{applied}");
     }
 
     #[tokio::test]

@@ -157,12 +157,21 @@ after its own plan, so a change is judged before it is made:
    toward an IC.
 2. `auto_place_from_schematic` — deterministic first placement by net
    clusters; explicitly a starting point, not a final layout.
-3. `refine_placement_force_directed` — deterministic spring embedder; pass
-   `locked` for parts that must not move. Same input, same plan.
-4. `place_decoupling_caps` — plans a row beside an IC from exact caller-given
+3. `refine_placement_force_directed` is deprecated. Its global-net spring
+   model can pull a part toward every footprint sharing a board-wide rail, so
+   it is not a recommended bulk-cleanup step. A dry-run exposes the
+   **plan_status** and **blocking_reasons** fields, per-move displacement, and
+   the proposed moves for diagnosis; a blocked plan cannot apply. Do not treat
+   those gates as evidence that the heuristic chose an electrically sensible
+   placement. Apply also requires a positive `max_displacement_mm` safety
+   limit; omitting it leaves the diagnostic plan blocked.
+4. For components `score_placement` flags, plan bounded explicit moves from
+   schematic function instead. Use `move_component` / `rotate_component` on a
+   small batch, then re-run `score_placement` and DRC before continuing.
+5. `place_decoupling_caps` — plans a row beside an IC from exact caller-given
    `capacitor_references` (never net-inferred); reports a blocked plan status
    naming why, and refuses to apply an out-of-bounds or non-improving plan.
-5. `plan_bga_fanout` — pitch detected from the pad grid; `apply` executes as
+6. `plan_bga_fanout` — pitch detected from the pad grid; `apply` executes as
    one KiCad undo commit over live IPC.
 
 Every planner is dry-run by default; apply refuses while KiCad holds the

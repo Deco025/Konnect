@@ -5,8 +5,8 @@
 //! targets, a score that does not improve, …); `status()` reports
 //! `"applicable"` only when none were found. The same shape is meant for
 //! every planner that can produce a plan a caller should not blindly apply
-//! (decoupling placement first; force-directed refinement is expected to
-//! adopt it next) so callers learn one contract, not one per tool.
+//! (decoupling placement and deprecated force-directed refinement) so callers
+//! learn one contract, not one per tool.
 
 use serde_json::{json, Value};
 

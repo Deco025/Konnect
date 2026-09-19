@@ -3,6 +3,26 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: force-directed refinement refuses unsafe plans
+
+`refine_placement_force_directed` is deprecated as a recommended bulk-cleanup
+workflow. Its global-net spring model can pull one footprint toward every
+other footprint sharing a board-wide rail, and a non-converged plan previously
+applied without proving that it improved placement.
+
+Dry-run responses now include `plan_status`, `blocking_reasons`, and
+`displacement_mm` for each planned move. A plan is blocked when it does not
+converge, does not improve the shared placement score, retains a hard-fail
+verdict, places a courtyard outside the board outline, exceeds the optional
+positive `max_displacement_mm`, or omits that limit. Dry-run still returns a
+blocked plan for diagnosis. Apply mode returns structured `plan_blocked` before
+the first mutation, and therefore requires `max_displacement_mm` even though
+the argument remains optional for diagnostic dry-runs.
+
+Use bounded explicit `move_component` / `rotate_component` operations derived
+from schematic function, with `score_placement` and KiCad DRC after each small
+batch, instead of treating the deprecated heuristic as an automatic placer.
+
 ## Unreleased: hierarchical sheets open without KiCad repair (patch release)
 
 `add_hierarchical_sheet` and `duplicate_sheet` previously omitted canonical
