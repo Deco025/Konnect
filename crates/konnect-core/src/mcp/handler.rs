@@ -1383,6 +1383,63 @@ mod annotate_dispatch_tests {
 }
 
 #[cfg(test)]
+mod hierarchy_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// The canonical hierarchy footer is a file-format compatibility guard,
+    /// so prove it is present after the deployed `tools/call` path rather than
+    /// testing only the private handler (#643).
+    #[tokio::test]
+    async fn add_hierarchical_sheet_writes_kicad10_root_footer_through_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("root.kicad_sch");
+        std::fs::write(&schematic, crate::tools::blank_schematic_template()).unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 643,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_hierarchical_sheet",
+                    "arguments": {
+                        "schematic": schematic.display().to_string(),
+                        "sheet_file": "power.kicad_sch",
+                        "sheet_name": "Power"
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+
+        let source = std::fs::read_to_string(&schematic).unwrap();
+        let tree = konnect_sexp::parse_sexp(&source).unwrap();
+        let root_path = tree
+            .find("sheet_instances")
+            .and_then(|instances| instances.find("path"))
+            .expect("served add writes the root sheet instance");
+        assert_eq!(root_path.get(1).and_then(|value| value.as_str()), Some("/"));
+        assert_eq!(tree.find_str("embedded_fonts"), Some("no"));
+        assert!(source.contains("(exclude_from_sim no)"));
+        assert!(source.contains("(do_not_autoplace no)"));
+    }
+}
+
+#[cfg(test)]
 mod rotate_junction_dispatch_tests {
     use super::*;
     use crate::tools::ServerConfig;
