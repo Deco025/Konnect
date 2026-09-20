@@ -209,7 +209,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_power_symbol",
-            "Add a power symbol (VCC, GND, etc.) to the schematic. Auto-numbers the \
+            "Add a power symbol (VCC, GND, etc.) to the schematic. Snaps the position to the \
+             1.27mm grid like the other placers, and reports the placed coordinates. Auto-numbers the \
              internal #PWR reference to the lowest number free on the sheet. Preserves every \
              saved hierarchy instance and reports committed-file readback; refuses stale \
              instance metadata before writing.",
@@ -2146,6 +2147,12 @@ async fn handle_add_power_symbol(
         Err(e) => return Ok(e),
     };
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+    // Snap like `place_one_component` does for the other two placers. Wires and
+    // labels are snapped to this grid, so a power symbol left off it cannot be
+    // reached by them: ERC reports the endpoint off grid and the pin
+    // unconnected (#662). Everything below, including the bound placement
+    // intent the readback is checked against, uses the snapped point.
+    let (x, y) = konnect_sexp::geometry::snap_point(x, y, 1.27);
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
@@ -4024,8 +4031,10 @@ mod power_symbol_tests {
             &json!({
                 "schematic": path.display().to_string(),
                 "power_net": "GND",
-                "x": 100.0,
-                "y": 80.0
+                // On the 1.27 mm grid (79 x 1.27, 63 x 1.27), so the anchor
+                // offsets asserted below are not mixed with the snap (#662).
+                "x": 100.33,
+                "y": 80.01
             }),
             &test_ctx(),
         )
@@ -4047,7 +4056,7 @@ mod power_symbol_tests {
             .unwrap();
         let ref_sexp = cse::sexp::writer::write(&ref_prop.to_sexp());
         assert!(
-            ref_sexp.contains("(at 100") && ref_sexp.contains("86.35"),
+            ref_sexp.contains("(at 100.33") && ref_sexp.contains("86.36"),
             "Reference must sit at the library's anchor near the symbol, not \
              sheet origin: {ref_sexp}"
         );
@@ -4062,7 +4071,7 @@ mod power_symbol_tests {
         let val_prop = sym.properties.iter().find(|p| p.name == "Value").unwrap();
         let val_sexp = cse::sexp::writer::write(&val_prop.to_sexp());
         assert!(
-            val_sexp.contains("(at 100") && val_sexp.contains("83.81"),
+            val_sexp.contains("(at 100.33") && val_sexp.contains("83.82"),
             "Value must sit near the symbol: {val_sexp}"
         );
         assert!(
@@ -4142,8 +4151,10 @@ mod power_symbol_tests {
             &json!({
                 "schematic": path.display().to_string(),
                 "power_net": "VCC",
-                "x": 100.0,
-                "y": 80.0
+                // On the 1.27 mm grid (79 x 1.27, 63 x 1.27), so the anchor
+                // offsets asserted below are not mixed with the snap (#662).
+                "x": 100.33,
+                "y": 80.01
             }),
             &test_ctx(),
         )
@@ -4160,7 +4171,7 @@ mod power_symbol_tests {
         let val_prop = sym.properties.iter().find(|p| p.name == "Value").unwrap();
         let val_sexp = cse::sexp::writer::write(&val_prop.to_sexp());
         assert!(
-            val_sexp.contains("76.444"),
+            val_sexp.contains("76.454"),
             "VCC's Value belongs above the symbol at y-3.556, not below: {val_sexp}"
         );
     }
