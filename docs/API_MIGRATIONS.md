@@ -58,6 +58,46 @@ that was on the grid, which includes any pin endpoint of a placed component,
 lands exactly where it did before; only an off-grid request moves, by at most
 0.635 mm on each axis.
 
+## Unreleased: `update_pcb_from_schematic` names every footprint it cannot place (minor release)
+
+One library footprint the typed placement path cannot carry (custom-shape pads
+today) turned the whole dry run into a `conflict` with a single diagnostic that
+named neither the footprint nor a part: `reference: null`, no footprint id, and
+preparation stopped at the first failure, so a second unusable footprint stayed
+hidden until the first was replaced. Separately, a connected pad the footprint
+does not have was checked only during apply, so a dry run could say `ready` for a
+plan whose apply then failed with `footprint J601 has no pad 3`.
+
+Both are now found while planning, and named. Status is still `conflict` and
+nothing is planned or applied.
+
+- Every diagnostic gains `references`, the list of every part it concerns, and
+  `footprint_id`, the library footprint it is about or `null`. `reference` keeps
+  its meaning: the one part concerned, or `null` when there are several or none.
+  For the existing single-part diagnostics `references` holds that one part.
+  This includes the single `preflight_conflict` diagnostic of a refusal before
+  any plan exists (saved hierarchy, netlist export, IPC preflight), which used
+  to carry only `code` and `message` and now carries `reference: null`,
+  `references: []` and `footprint_id: null` as well.
+- There is one diagnostic per footprint that cannot be prepared, listing every
+  part that needs it. Its `code` says which stage failed, in the vocabulary
+  `update_footprints_from_library` already uses:
+  `footprint_library_resolution_failed` (the library id does not resolve),
+  `footprint_library_read_failed` (the file cannot be read) and
+  `unsupported_library_footprint` (it holds something Konnect cannot place).
+  **Changed value:** the custom-pad case was reported as
+  `footprint_library_resolution_failed`, although the library resolved; it is
+  now `unsupported_library_footprint`.
+- New code `footprint_pad_missing`: the schematic connects a pad the library
+  footprint (for an addition) or the live footprint (for an update) does not
+  have. It carries `reference` and `footprint_id`, and the message names the pads.
+
+Callers do not change their requests. A caller that matched
+`footprint_library_resolution_failed` to detect custom-shape pads should match
+`unsupported_library_footprint` instead. Custom-shape pads are still not
+supported; the fix is that the refusal now says which footprint to substitute
+and for which parts.
+
 ## Unreleased: force-directed refinement refuses unsafe plans
 
 `refine_placement_force_directed` is deprecated as a recommended bulk-cleanup

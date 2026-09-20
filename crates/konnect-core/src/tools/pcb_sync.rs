@@ -4,7 +4,7 @@
 //! This module owns the deep planning interface: turn a KiCad-exported
 //! flattened netlist plus a board snapshot into a complete, immutable plan.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::mcp::protocol::{CallToolResult, ToolContent};
@@ -95,6 +95,9 @@ struct BoardFootprint {
     footprint_id: String,
     symbol_path: Option<String>,
     pad_nets: BTreeMap<String, String>,
+    /// Every pad the live footprint has, netted or not. `pad_nets` holds only
+    /// pads that carry a net, so it cannot answer whether a pad exists.
+    pad_numbers: BTreeSet<String>,
     position: Point,
     rotation: f64,
     layer: String,
@@ -174,7 +177,15 @@ enum PlannedChange {
 struct SyncDiagnostic {
     code: String,
     message: String,
+    /// The one part the diagnostic concerns; `None` when it concerns several
+    /// parts or the board as a whole.
     reference: Option<String>,
+    /// Every part the diagnostic concerns. One unusable library footprint
+    /// blocks each part that uses it, and the caller has to be told all of
+    /// them to know what to substitute (#657).
+    references: Vec<String>,
+    /// The library footprint the diagnostic is about, when it is about one.
+    footprint_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -290,23 +301,20 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
             let mut plan = plan_sync(&netlist_source, &design, &snapshot.state);
-            let prepared = match prepare_additions(&library_board, &plan) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    plan.status = PlanStatus::Conflict;
-                    plan.counts.added.planned = 0;
-                    plan.counts.updated.planned = 0;
-                    plan.counts.pads_reassigned.planned = 0;
-                    plan.counts.conflicts.planned += 1;
-                    plan.diagnostics.push(conflict(
-                        "footprint_library_resolution_failed",
-                        format!("{error:#}"),
-                        None,
-                    ));
-                    plan.changes.clear();
-                    return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
-                }
-            };
+            let (prepared, unprepared) = prepare_additions(&library_board, &plan);
+            // Everything that would fail the apply is found here, so `ready`
+            // means ready: each footprint that cannot be prepared, named with
+            // the parts that need it, and each connected pad a prepared
+            // footprint does not have.
+            let mut preflight = unprepared
+                .into_iter()
+                .map(UnpreparedFootprint::into_diagnostic)
+                .collect::<Vec<_>>();
+            preflight.extend(additions_missing_pads(&plan, &prepared));
+            if !preflight.is_empty() {
+                refuse_plan(&mut plan, preflight);
+                return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
+            }
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
             refresh_revision_with_staging(&mut plan);
 
@@ -421,6 +429,10 @@ fn sync_response(
     CallToolResult::json(&value)
 }
 
+/// A refusal before any plan exists: the saved hierarchy, the netlist export
+/// or the IPC preflight failed. Its one diagnostic is built by `conflict`, the
+/// constructor every planned diagnostic uses, so a caller reads the same
+/// fields whichever stage refused.
 fn conflict_result(message: String) -> CallToolResult {
     let value = serde_json::json!({
         "status": "conflict",
@@ -434,7 +446,7 @@ fn conflict_result(message: String) -> CallToolResult {
             "unassigned_footprint": CountPair::default(),
             "conflicts": CountPair { planned: 1, applied: 0 }
         },
-        "diagnostics": [{ "code": "preflight_conflict", "message": message }]
+        "diagnostics": [conflict("preflight_conflict", message, None)]
     });
     CallToolResult {
         content: vec![ToolContent::Text {
@@ -702,6 +714,18 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             ));
             continue;
         }
+        // A pad the schematic connects and the live footprint lacks used to
+        // reach `apply_footprint_fields` and fail the apply, after a dry run
+        // that said `ready` (#657).
+        let missing = missing_pads(&component.pad_nets, &footprint.pad_numbers);
+        if !missing.is_empty() {
+            diagnostics.push(pad_missing_conflict(
+                &component.reference,
+                &footprint.footprint_id,
+                &missing,
+            ));
+            continue;
+        }
 
         let mut changed_pads = 0usize;
         let pad_numbers = component
@@ -793,7 +817,73 @@ fn conflict(code: &str, message: String, reference: Option<&str>) -> SyncDiagnos
         code: code.to_string(),
         message,
         reference: reference.map(str::to_string),
+        references: reference.map(str::to_string).into_iter().collect(),
+        footprint_id: None,
     }
+}
+
+/// A diagnostic about one library footprint and every part that uses it.
+/// `reference` keeps its single-part meaning, so it is set only when exactly
+/// one part is concerned.
+fn footprint_conflict(
+    code: &str,
+    message: String,
+    footprint_id: &str,
+    references: Vec<String>,
+) -> SyncDiagnostic {
+    SyncDiagnostic {
+        code: code.to_string(),
+        message,
+        reference: match references.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        },
+        references,
+        footprint_id: Some(footprint_id.to_string()),
+    }
+}
+
+/// References for a message, bounded: a common footprint can block hundreds
+/// of parts, and the complete list is in the diagnostic's `references`.
+fn listed(references: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let shown = references
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match references.len().saturating_sub(SHOWN) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
+/// The schematic connects a pad the footprint does not have. `missing` is
+/// never empty.
+fn pad_missing_conflict(reference: &str, footprint_id: &str, missing: &[&str]) -> SyncDiagnostic {
+    let pads = if missing.len() == 1 { "pad" } else { "pads" };
+    footprint_conflict(
+        "footprint_pad_missing",
+        format!(
+            "the schematic connects {reference} {pads} {}, which footprint {footprint_id} does not have",
+            missing.join(", ")
+        ),
+        footprint_id,
+        vec![reference.to_string()],
+    )
+}
+
+/// Pad numbers the schematic connects that `available` does not contain.
+fn missing_pads<'a>(
+    pad_nets: &'a BTreeMap<String, String>,
+    available: &BTreeSet<String>,
+) -> Vec<&'a str> {
+    pad_nets
+        .keys()
+        .filter(|number| !available.contains(*number))
+        .map(String::as_str)
+        .collect()
 }
 
 /// A stable identity for the design-bearing netlist sections.
@@ -1541,23 +1631,27 @@ fn board_footprint_from_instance(
         .as_ref()
         .context("KiCad returned a footprint without a definition")?;
     let mut pad_nets = BTreeMap::new();
+    let mut pad_numbers = BTreeSet::new();
     for child in &definition.items {
         // Same discriminator as `apply_footprint_fields`, for the same
-        // reason: a graphic decodes happily as an empty pad.
+        // reason: a graphic can decode as an empty pad.
         //
-        // No test covers this one, and deliberately so — it has no
-        // observable effect today. A graphic decoded as a pad has
-        // `net: None`, so the filter below drops it anyway, and this
-        // function never writes. It is here because the next person to add
-        // a field to this loop should not have to rediscover why reading
-        // `definition.items` untyped is unsafe. Neutering it changes
-        // nothing, which is the honest result.
+        // No test covers this one, and deliberately so: it has no effect
+        // that a message KiCad actually sends can show. Every drawing, field
+        // and text in the checked-in KiCad 10 captures fails `Pad::decode` on
+        // a wire-type mismatch and is skipped by the `else` below, so
+        // neutering this check changes nothing. That was measured again for
+        // #657, which added `pad_numbers` to this loop: a shape that did
+        // decode would add the empty pad number. It stays so the next person
+        // to touch this loop does not have to rediscover why reading
+        // `definition.items` untyped is unsafe.
         if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
             continue;
         }
         let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) else {
             continue;
         };
+        pad_numbers.insert(pad.number.clone());
         if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
             pad_nets.insert(pad.number, net.name);
         }
@@ -1574,6 +1668,7 @@ fn board_footprint_from_instance(
             .unwrap_or_default(),
         symbol_path: board_symbol_path(footprint.symbol_path.as_ref()),
         pad_nets,
+        pad_numbers,
         position: Point {
             x: position
                 .map(|point| konnect_ipc::builders::nm_to_mm(point.x_nm))
@@ -1667,32 +1762,154 @@ fn record_routed_net(
     }
 }
 
-fn prepare_additions(board: &Path, plan: &SyncPlan) -> Result<BTreeMap<String, PreparedFootprint>> {
+/// A library footprint the plan wants to place and Konnect could not prepare,
+/// with every part that needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnpreparedFootprint {
+    footprint_id: String,
+    references: Vec<String>,
+    code: &'static str,
+    reason: String,
+}
+
+impl UnpreparedFootprint {
+    fn into_diagnostic(self) -> SyncDiagnostic {
+        let message = format!(
+            "{} cannot be placed (needed by {}): {}",
+            self.footprint_id,
+            listed(&self.references),
+            self.reason
+        );
+        footprint_conflict(self.code, message, &self.footprint_id, self.references)
+    }
+}
+
+/// Read one library footprint into what the typed placement path sends. The
+/// three codes are the ones `update_footprints_from_library` uses for the
+/// same three failures, because the caller's next step differs: fix the
+/// library table, fix the file, or substitute the footprint.
+fn prepare_footprint(
+    footprint_id: &str,
+    board_path: &Path,
+) -> std::result::Result<PreparedFootprint, (&'static str, String)> {
+    let path = super::pcb_components::resolve_footprint_file(footprint_id, board_path)
+        .map_err(|error| ("footprint_library_resolution_failed", format!("{error:#}")))?;
+    let source = std::fs::read_to_string(&path).map_err(|error| {
+        (
+            "footprint_library_read_failed",
+            format!("failed to read {}: {error}", path.display()),
+        )
+    })?;
+    let unsupported =
+        |error: anyhow::Error| ("unsupported_library_footprint", format!("{error:#}"));
+    let pads = super::pcb_components::extract_pad_definitions(&source).map_err(unsupported)?;
+    let graphics =
+        super::pcb_components::extract_graphic_definitions(&source).map_err(unsupported)?;
+    let fields = super::pcb_components::extract_field_placement(&source);
+    let (width, height) = footprint_dimensions(&pads, &graphics);
+    Ok(PreparedFootprint {
+        pads,
+        graphics,
+        fields,
+        width,
+        height,
+    })
+}
+
+/// Prepare every footprint the plan adds. One that cannot be prepared does
+/// not stop the rest: stopping at the first produced a single diagnostic that
+/// named neither the footprint nor a part, and hid every other unusable
+/// footprint behind it (#657).
+fn prepare_additions(
+    board_path: &Path,
+    plan: &SyncPlan,
+) -> (
+    BTreeMap<String, PreparedFootprint>,
+    Vec<UnpreparedFootprint>,
+) {
     let mut prepared = BTreeMap::new();
+    let mut unprepared: BTreeMap<String, UnpreparedFootprint> = BTreeMap::new();
     for change in &plan.changes {
-        let PlannedChange::Add { footprint_id, .. } = change else {
+        let PlannedChange::Add {
+            footprint_id,
+            reference,
+            ..
+        } = change
+        else {
             continue;
         };
         if prepared.contains_key(footprint_id) {
             continue;
         }
-        let source = super::pcb_components::resolve_footprint_source(footprint_id, board)?;
-        let pads = super::pcb_components::extract_pad_definitions(&source)?;
-        let graphics = super::pcb_components::extract_graphic_definitions(&source)?;
-        let fields = super::pcb_components::extract_field_placement(&source);
-        let (width, height) = footprint_dimensions(&pads, &graphics);
-        prepared.insert(
-            footprint_id.clone(),
-            PreparedFootprint {
-                pads,
-                graphics,
-                fields,
-                width,
-                height,
-            },
-        );
+        if let Some(failed) = unprepared.get_mut(footprint_id) {
+            failed.references.push(reference.clone());
+            continue;
+        }
+        match prepare_footprint(footprint_id, board_path) {
+            Ok(part) => {
+                prepared.insert(footprint_id.clone(), part);
+            }
+            Err((code, reason)) => {
+                unprepared.insert(
+                    footprint_id.clone(),
+                    UnpreparedFootprint {
+                        footprint_id: footprint_id.clone(),
+                        references: vec![reference.clone()],
+                        code,
+                        reason,
+                    },
+                );
+            }
+        }
     }
-    Ok(prepared)
+    (prepared, unprepared.into_values().collect())
+}
+
+/// Additions whose schematic connects a pad the prepared library footprint
+/// does not have. The update path is checked in `plan_sync`, which holds the
+/// live footprint's pads; this is the same rule against the library's.
+fn additions_missing_pads(
+    plan: &SyncPlan,
+    prepared: &BTreeMap<String, PreparedFootprint>,
+) -> Vec<SyncDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for change in &plan.changes {
+        let PlannedChange::Add {
+            reference,
+            footprint_id,
+            pad_nets,
+            ..
+        } = change
+        else {
+            continue;
+        };
+        // An unprepared footprint is already reported, with this part named.
+        let Some(part) = prepared.get(footprint_id) else {
+            continue;
+        };
+        let available = part
+            .pads
+            .iter()
+            .map(|pad| pad.number.clone())
+            .collect::<BTreeSet<_>>();
+        let missing = missing_pads(pad_nets, &available);
+        if !missing.is_empty() {
+            diagnostics.push(pad_missing_conflict(reference, footprint_id, &missing));
+        }
+    }
+    diagnostics
+}
+
+/// Turn a plan into a conflict the way `plan_sync` does for its own
+/// diagnostics: nothing stays planned, so nothing can be applied.
+fn refuse_plan(plan: &mut SyncPlan, diagnostics: Vec<SyncDiagnostic>) {
+    plan.status = PlanStatus::Conflict;
+    plan.counts.added.planned = 0;
+    plan.counts.updated.planned = 0;
+    plan.counts.pads_reassigned.planned = 0;
+    plan.counts.conflicts.planned += diagnostics.len();
+    plan.diagnostics.extend(diagnostics);
+    plan.changes.clear();
 }
 
 fn footprint_dimensions(
@@ -2109,6 +2326,7 @@ mod tests {
                 ("1".to_string(), "VCC".to_string()),
                 ("2".to_string(), "GND".to_string()),
             ]),
+            pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
             position: Point { x: 1.0, y: 2.0 },
             rotation: 0.0,
             layer: "F.Cu".to_string(),
@@ -2153,6 +2371,7 @@ mod tests {
                         ("1".to_string(), "VCC".to_string()),
                         ("2".to_string(), "GND".to_string()),
                     ]),
+                    pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
                     position: Point { x: 25.0, y: 30.0 },
                     rotation: 90.0,
                     layer: "B.Cu".to_string(),
@@ -2167,6 +2386,7 @@ mod tests {
                     footprint_id: "MountingHole:MountingHole_3.2mm_M3".to_string(),
                     symbol_path: None,
                     pad_nets: BTreeMap::new(),
+                    pad_numbers: BTreeSet::new(),
                     position: Point { x: 2.0, y: 2.0 },
                     rotation: 0.0,
                     layer: "F.Cu".to_string(),
@@ -2585,6 +2805,7 @@ mod tests {
                 footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
                 symbol_path: Some("/sheet/existing".to_string()),
                 pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
+                pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
                 position: Point { x: 1.0, y: 2.0 },
                 rotation: 0.0,
                 layer: "F.Cu".to_string(),
@@ -3033,6 +3254,9 @@ mod tests {
             ("1".to_string(), "VCC".to_string()),
             ("2".to_string(), "GND".to_string()),
         ]);
+        // The capture is a mounting hole dressed as the schematic's resistor,
+        // so it is given the resistor's pads along with their nets.
+        footprint.pad_numbers = BTreeSet::from(["1".to_string(), "2".to_string()]);
         let plan = plan_sync("netlist", &design, &board_with(vec![footprint]));
 
         // Was `reference_identity_conflict`: the board footprint appeared to
@@ -3246,6 +3470,9 @@ mod tests {
         pathed.symbol_path = Some("/sheet/existing".to_string());
         pathed.footprint_id = "Resistor_SMD:R_0603_1608Metric".to_string();
         pathed.value = "10k".to_string();
+        // A captured graphic dressed as the schematic's resistor, so it is
+        // given the resistor's pads as well as its identity.
+        pathed.pad_numbers = BTreeSet::from(["1".to_string(), "2".to_string()]);
         let board = board_with(vec![
             pathed,
             board_footprint_from_instance(&ref_star_instance("loose-kiid")).unwrap(),
@@ -3593,6 +3820,557 @@ mod tests {
         assert_eq!(
             zones_after, zones_before,
             "the copper zone and keep-out/rule area must retain their complete protobuf identity and geometry"
+        );
+    }
+
+    // ─── #657: name what cannot be prepared, and let `ready` mean ready ──────
+
+    const TEXAS_VQFN: &str =
+        "Package_DFN_QFN:Texas_RJE0020A_VQFN-20-1EP_3x3mm_P0.45mm_EP0.675x0.76mm";
+    const GENERIC_VQFN: &str = "Package_DFN_QFN:VQFN-20-1EP_3x3mm_P0.45mm_EP1.55x1.55mm";
+    const STOCK_0603: &str = "Capacitor_SMD:C_0603_1608Metric";
+
+    /// A project whose own `fp-lib-table` resolves three stock KiCad 10.0.5
+    /// footprints: the two with custom-shape pads that #657 met on a real
+    /// board (provenance in `tests/fixtures/custom_pads_kicad10.README.md`)
+    /// and a plain 0603. A project table shadows the global one, so these
+    /// files are the ones read whether or not KiCad is installed.
+    fn project_with_stock_footprints() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("carrier.kicad_pcb");
+        std::fs::write(
+            &board,
+            include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb"),
+        )
+        .unwrap();
+        let stock: [(&str, &[u8]); 3] = [
+            (
+                TEXAS_VQFN,
+                include_bytes!("../../tests/fixtures/custom_pads_texas_rje0020a_kicad10.kicad_mod"),
+            ),
+            (
+                GENERIC_VQFN,
+                include_bytes!("../../tests/fixtures/custom_pads_vqfn20_kicad10.kicad_mod"),
+            ),
+            (
+                STOCK_0603,
+                include_bytes!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod"),
+            ),
+        ];
+        for (footprint_id, source) in stock {
+            let (library, name) = footprint_id.split_once(':').unwrap();
+            let directory = temp.path().join(format!("{library}.pretty"));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(format!("{name}.kicad_mod")), source).unwrap();
+        }
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table\n  (lib (name \"Package_DFN_QFN\") (type \"KiCad\") (uri \"${KIPRJMOD}/Package_DFN_QFN.pretty\") (options \"\") (descr \"\"))\n  (lib (name \"Capacitor_SMD\") (type \"KiCad\") (uri \"${KIPRJMOD}/Capacitor_SMD.pretty\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+        (temp, board)
+    }
+
+    fn planned_add(reference: &str, footprint_id: &str, pads: &[&str]) -> PlannedChange {
+        PlannedChange::Add {
+            reference: reference.to_string(),
+            value: "part".to_string(),
+            footprint_id: footprint_id.to_string(),
+            symbol_path: format!("/{reference}-uuid"),
+            dnp: false,
+            pad_nets: pads
+                .iter()
+                .map(|pad| (pad.to_string(), format!("{reference}-{pad}")))
+                .collect(),
+            position: Point { x: 0.0, y: 0.0 },
+        }
+    }
+
+    fn plan_adding(changes: Vec<PlannedChange>) -> SyncPlan {
+        SyncPlan {
+            status: PlanStatus::Ready,
+            plan_revision: "reviewed".to_string(),
+            counts: SyncCounts {
+                added: CountPair {
+                    planned: changes.len(),
+                    applied: 0,
+                },
+                ..SyncCounts::default()
+            },
+            changes,
+            diagnostics: Vec::new(),
+            unassigned: Vec::new(),
+        }
+    }
+
+    /// #657: the first unusable footprint stopped preparation, so a plan that
+    /// needed two of them heard about one, and about neither by name.
+    #[test]
+    fn every_unusable_footprint_is_named_with_the_parts_that_need_it() {
+        let (_temp, board) = project_with_stock_footprints();
+        let plan = plan_adding(vec![
+            planned_add("U1", TEXAS_VQFN, &["1"]),
+            planned_add("C1", STOCK_0603, &["1", "2"]),
+            planned_add("U3", GENERIC_VQFN, &["1"]),
+            planned_add("U2", TEXAS_VQFN, &["1"]),
+        ]);
+
+        let (prepared, unprepared) = prepare_additions(&board, &plan);
+
+        assert_eq!(
+            prepared.keys().map(String::as_str).collect::<Vec<_>>(),
+            [STOCK_0603],
+            "a footprint that can be placed is still prepared"
+        );
+        let diagnostics = unprepared
+            .into_iter()
+            .map(UnpreparedFootprint::into_diagnostic)
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+
+        let texas = &diagnostics[0];
+        assert_eq!(texas.code, "unsupported_library_footprint");
+        assert_eq!(texas.footprint_id.as_deref(), Some(TEXAS_VQFN));
+        assert_eq!(texas.references, ["U1", "U2"]);
+        assert_eq!(
+            texas.reference, None,
+            "two parts are concerned, so no single one is named"
+        );
+        assert!(
+            texas.message.contains(TEXAS_VQFN)
+                && texas.message.contains("U1, U2")
+                && texas.message.contains("custom-shape pads"),
+            "{}",
+            texas.message
+        );
+
+        let generic = &diagnostics[1];
+        assert_eq!(generic.code, "unsupported_library_footprint");
+        assert_eq!(generic.footprint_id.as_deref(), Some(GENERIC_VQFN));
+        assert_eq!(generic.references, ["U3"]);
+        assert_eq!(generic.reference.as_deref(), Some("U3"));
+    }
+
+    /// The caller's next step differs with the stage that failed: fix the
+    /// library table, fix the file, or substitute the footprint. The codes are
+    /// the ones `update_footprints_from_library` reports for the same three.
+    #[test]
+    fn each_stage_of_preparation_fails_under_its_own_code() {
+        let (temp, board) = project_with_stock_footprints();
+        std::fs::write(
+            temp.path()
+                .join("Capacitor_SMD.pretty/Unreadable.kicad_mod"),
+            [0xff, 0xfe, 0x00, 0x28],
+        )
+        .unwrap();
+        let plan = plan_adding(vec![
+            planned_add("J1", "Konnect_No_Such_Library:Nothing", &["1"]),
+            planned_add("C9", "Capacitor_SMD:Unreadable", &["1"]),
+            planned_add("U1", TEXAS_VQFN, &["1"]),
+        ]);
+
+        let (prepared, unprepared) = prepare_additions(&board, &plan);
+
+        assert!(prepared.is_empty());
+        let by_reference = unprepared
+            .iter()
+            .map(|failed| (failed.references[0].as_str(), failed.code))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            by_reference,
+            BTreeMap::from([
+                ("C9", "footprint_library_read_failed"),
+                ("J1", "footprint_library_resolution_failed"),
+                ("U1", "unsupported_library_footprint"),
+            ])
+        );
+    }
+
+    /// A message names at most eight parts; `references` names them all.
+    #[test]
+    fn a_message_is_bounded_and_the_reference_list_is_complete() {
+        let references = (1..=30).map(|n| format!("C{n}")).collect::<Vec<_>>();
+        let diagnostic = UnpreparedFootprint {
+            footprint_id: TEXAS_VQFN.to_string(),
+            references: references.clone(),
+            code: "unsupported_library_footprint",
+            reason: "custom-shape pads".to_string(),
+        }
+        .into_diagnostic();
+
+        assert_eq!(diagnostic.references, references);
+        assert!(
+            diagnostic.message.contains("C8 and 22 more") && !diagnostic.message.contains("C9,"),
+            "{}",
+            diagnostic.message
+        );
+    }
+
+    /// Add path: `footprint C1 has no pad 3` used to be raised only inside
+    /// the apply, after a dry run that said `ready`.
+    #[test]
+    fn a_connected_pad_the_library_footprint_lacks_is_found_while_planning() {
+        let (_temp, board) = project_with_stock_footprints();
+        let plan = plan_adding(vec![
+            planned_add("C1", STOCK_0603, &["1", "2", "3", "4"]),
+            planned_add("C2", STOCK_0603, &["1", "2"]),
+        ]);
+        let (prepared, unprepared) = prepare_additions(&board, &plan);
+        assert!(unprepared.is_empty());
+
+        let diagnostics = additions_missing_pads(&plan, &prepared);
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        let missing = &diagnostics[0];
+        assert_eq!(missing.code, "footprint_pad_missing");
+        assert_eq!(missing.reference.as_deref(), Some("C1"));
+        assert_eq!(missing.references, ["C1"]);
+        assert_eq!(missing.footprint_id.as_deref(), Some(STOCK_0603));
+        assert!(missing.message.contains("pads 3, 4"), "{}", missing.message);
+    }
+
+    /// Update path: the same rule against the pads of the live footprint.
+    /// Before, this planned an update with one pad reassigned and said
+    /// `ready`; the apply then failed on `footprint R1 has no pad 3`.
+    #[test]
+    fn a_connected_pad_the_live_footprint_lacks_is_found_while_planning() {
+        let mut component = resistor("R1", "/sheet/existing");
+        component
+            .pad_nets
+            .insert("3".to_string(), "SENSE".to_string());
+        let design = ExportedDesign {
+            components: vec![component],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        let board = board_with(vec![board_resistor("R1", Some("/sheet/existing"))]);
+
+        let plan = plan_sync("netlist", &design, &board);
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.counts.updated.planned, 0);
+        assert_eq!(plan.diagnostics.len(), 1, "{:#?}", plan.diagnostics);
+        let missing = &plan.diagnostics[0];
+        assert_eq!(missing.code, "footprint_pad_missing");
+        assert_eq!(missing.reference.as_deref(), Some("R1"));
+        assert_eq!(
+            missing.footprint_id.as_deref(),
+            Some("Resistor_SMD:R_0603_1608Metric")
+        );
+        assert!(missing.message.contains("pad 3"), "{}", missing.message);
+    }
+
+    /// The pad set is every pad KiCad sent, netted or not. The 0402 from the
+    /// #474 capture has pads 1 and 2. The captured mounting hole has one pad,
+    /// with the empty number and no net: exactly the pad `pad_nets` never
+    /// held, which is why it cannot answer whether a pad exists.
+    #[test]
+    fn the_live_footprint_records_every_pad_kicad_sent() {
+        use konnect_ipc::gen::kiapi;
+        const RESISTOR: &[u8] = include_bytes!("../../tests/fixtures/issue_474_r1.ipc.bin");
+        let resistor = kiapi::board::types::FootprintInstance::decode(RESISTOR)
+            .expect("the checked-in KiCad IPC capture must decode");
+        let mounting_hole = kiapi::board::types::FootprintInstance::decode(BOARD_ONLY_CAPTURE)
+            .expect("the checked-in KiCad IPC capture must decode");
+
+        let resistor = board_footprint_from_instance(&resistor).unwrap();
+        let mounting_hole = board_footprint_from_instance(&mounting_hole).unwrap();
+
+        assert_eq!(
+            resistor.pad_numbers,
+            BTreeSet::from(["1".to_string(), "2".to_string()])
+        );
+        assert_eq!(mounting_hole.pad_numbers, BTreeSet::from([String::new()]));
+        assert!(mounting_hole.pad_nets.is_empty());
+    }
+
+    /// A single-part diagnostic lists that part in `references` too, so a
+    /// caller can read one field for every diagnostic.
+    #[test]
+    fn a_single_part_diagnostic_lists_its_part() {
+        let diagnostic = conflict("duplicate_board_reference", "message".into(), Some("R1"));
+        assert_eq!(diagnostic.reference.as_deref(), Some("R1"));
+        assert_eq!(diagnostic.references, ["R1"]);
+        assert_eq!(diagnostic.footprint_id, None);
+
+        let board_level = conflict("stale_plan_revision", "message".into(), None);
+        assert!(board_level.references.is_empty());
+    }
+
+    /// One `(comp …)` per part and one net per pin, in the shape
+    /// `kicad-cli sch export netlist --format kicadsexpr` writes.
+    fn exported_netlist(components: &[(&str, &str, &[&str])]) -> String {
+        let mut parts = String::new();
+        let mut nets = String::new();
+        let mut code = 0;
+        for (reference, footprint_id, pins) in components {
+            let pin_list = pins
+                .iter()
+                .map(|pin| format!("(pin (num \"{pin}\"))"))
+                .collect::<String>();
+            parts.push_str(&format!(
+                "    (comp\n      (ref \"{reference}\")\n      (value \"part\")\n      (footprint \"{footprint_id}\")\n      (sheetpath (names \"/\") (tstamps \"/\"))\n      (tstamps \"{reference}-uuid\")\n      (units (unit (name \"A\") (pins {pin_list}))))\n"
+            ));
+            for pin in *pins {
+                code += 1;
+                nets.push_str(&format!(
+                    "    (net (code \"{code}\") (name \"{reference}-{pin}\") (class \"Default\")\n      (node (ref \"{reference}\") (pin \"{pin}\") (pintype \"passive\")))\n"
+                ));
+            }
+        }
+        format!("(export\n  (components\n{parts}  )\n  (nets\n{nets}  ))\n")
+    }
+
+    /// Everything a served dry run needs without KiCad: a stand-in
+    /// `kicad-cli` that hands back `netlist`, and a protobuf mock holding the
+    /// project's board open with nothing on it.
+    struct ServedSync {
+        _temp: tempfile::TempDir,
+        _kicad: crate::test_support::MockIpcServer,
+        handler: crate::mcp::handler::McpHandler,
+        schematic: PathBuf,
+        board: PathBuf,
+        exported: PathBuf,
+    }
+
+    impl ServedSync {
+        async fn new() -> Self {
+            use crate::tools::cli::test_support::write_script;
+            use konnect_ipc::gen::kiapi;
+
+            let (temp, board) = project_with_stock_footprints();
+            let schematic = temp.path().join("carrier.kicad_sch");
+            std::fs::write(
+                &schematic,
+                include_bytes!("../../tests/fixtures/structural_scans_kicad10.kicad_sch"),
+            )
+            .unwrap();
+            let exported = temp.path().join("carrier.net");
+            let unix_source = exported.to_string_lossy().replace('\'', "'\\''");
+            let windows_source = exported.to_string_lossy();
+            let cli = write_script(
+                temp.path(),
+                "fake-kicad-cli-657",
+                &format!(
+                    "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    shift\n    cp '{unix_source}' \"$1\"\n    exit $?\n  fi\n  shift\ndone\nexit 2\n"
+                ),
+                &format!(
+                    "@echo off\r\n:loop\r\nif \"%~1\"==\"\" exit /b 2\r\nif \"%~1\"==\"--output\" goto found\r\nshift\r\ngoto loop\r\n:found\r\nshift\r\ncopy /Y \"{windows_source}\" \"%~1\" >nul\r\nexit /b %ERRORLEVEL%\r\n"
+                ),
+            );
+            let kicad =
+                crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, |command| {
+                    if command.type_url.ends_with("GetItems") {
+                        return Some(konnect_ipc::builders::pack_any(
+                            &kiapi::common::commands::GetItemsResponse {
+                                header: None,
+                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                items: Vec::new(),
+                            },
+                            "kiapi.common.commands.GetItemsResponse",
+                        ));
+                    }
+                    if command.type_url.ends_with("GetNets") {
+                        return Some(konnect_ipc::builders::pack_any(
+                            &kiapi::board::commands::NetsResponse { nets: Vec::new() },
+                            "kiapi.board.commands.NetsResponse",
+                        ));
+                    }
+                    if command.type_url.ends_with("GetBoundingBox") {
+                        return Some(konnect_ipc::builders::pack_any(
+                            &kiapi::common::commands::GetBoundingBoxResponse {
+                                items: Vec::new(),
+                                boxes: vec![kiapi::common::types::Box2 {
+                                    position: Some(konnect_ipc::builders::vec2(0.0, 0.0)),
+                                    size: Some(konnect_ipc::builders::vec2(50.0, 40.0)),
+                                }],
+                            },
+                            "kiapi.common.commands.GetBoundingBoxResponse",
+                        ));
+                    }
+                    None
+                });
+            let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+                kicad_cli: cli.to_string_lossy().to_string(),
+                kicad_binary: String::new(),
+                ipc_address: kicad.address().to_string(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: true,
+            })
+            .await
+            .expect("handler builds");
+            Self {
+                _temp: temp,
+                _kicad: kicad,
+                handler,
+                schematic,
+                board,
+                exported,
+            }
+        }
+
+        /// A dry run through `tools/call`, for a schematic exporting `netlist`.
+        async fn dry_run(&self, netlist: &str) -> serde_json::Value {
+            self.dry_run_result(netlist).await.1
+        }
+
+        /// As [`Self::dry_run`], with the result's `isError` beside the body.
+        async fn dry_run_result(&self, netlist: &str) -> (bool, serde_json::Value) {
+            std::fs::write(&self.exported, netlist).unwrap();
+            let response = self
+                .handler
+                .handle_message(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 657,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "update_pcb_from_schematic",
+                        "arguments": {
+                            "schematic": self.schematic.to_string_lossy(),
+                            "board": self.board.to_string_lossy()
+                        }
+                    }
+                }))
+                .await
+                .expect("tools/call receives a response");
+            let result = response.result.expect("successful JSON-RPC response");
+            (
+                result["isError"] == serde_json::json!(true),
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            )
+        }
+    }
+
+    /// #657 through the served boundary. The run that found it needed two
+    /// unusable footprints and was told of one, with `reference: null` and no
+    /// footprint: every part and both footprints are named now, nothing is
+    /// planned, and a plan that can be placed still says `ready`.
+    #[tokio::test]
+    async fn two_unusable_footprints_are_both_named_through_the_served_dispatch() {
+        let served = ServedSync::new().await;
+
+        let refused = served
+            .dry_run(&exported_netlist(&[
+                ("U1", TEXAS_VQFN, &["1", "2"]),
+                ("C1", STOCK_0603, &["1", "2"]),
+                ("U3", GENERIC_VQFN, &["1", "2"]),
+                ("U2", TEXAS_VQFN, &["1", "2"]),
+            ]))
+            .await;
+
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        assert_eq!(refused["changes"], serde_json::json!([]));
+        assert_eq!(refused["coverage"]["footprints_added"]["planned"], 0);
+        assert_eq!(refused["coverage"]["conflicts"]["planned"], 2);
+        assert_eq!(
+            refused["diagnostics"],
+            serde_json::json!([
+                {
+                    "code": "unsupported_library_footprint",
+                    "message": format!(
+                        "{TEXAS_VQFN} cannot be placed (needed by U1, U2): custom-shape pads \
+                         are not supported by KiCad 10's typed placement path"
+                    ),
+                    "reference": null,
+                    "references": ["U1", "U2"],
+                    "footprint_id": TEXAS_VQFN
+                },
+                {
+                    "code": "unsupported_library_footprint",
+                    "message": format!(
+                        "{GENERIC_VQFN} cannot be placed (needed by U3): custom-shape pads \
+                         are not supported by KiCad 10's typed placement path"
+                    ),
+                    "reference": "U3",
+                    "references": ["U3"],
+                    "footprint_id": GENERIC_VQFN
+                }
+            ])
+        );
+
+        let placeable = served
+            .dry_run(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+        assert_eq!(placeable["status"], "ready", "{placeable:#}");
+        assert_eq!(placeable["coverage"]["footprints_added"]["planned"], 1);
+        assert_eq!(placeable["diagnostics"], serde_json::json!([]));
+    }
+
+    /// A dry run said `ready` for a part whose schematic connects a pad its
+    /// footprint does not have, and the apply then failed its preflight. The
+    /// dry run is where it is refused now, by name.
+    #[tokio::test]
+    async fn a_missing_pad_refuses_the_dry_run_through_the_served_dispatch() {
+        let served = ServedSync::new().await;
+
+        let refused = served
+            .dry_run(&exported_netlist(&[
+                ("C1", STOCK_0603, &["1", "2", "3"]),
+                ("C2", STOCK_0603, &["1", "2"]),
+            ]))
+            .await;
+
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        assert_eq!(refused["changes"], serde_json::json!([]));
+        assert_eq!(refused["coverage"]["footprints_added"]["planned"], 0);
+        let diagnostics = refused["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{refused:#}");
+        assert_eq!(diagnostics[0]["code"], "footprint_pad_missing");
+        assert_eq!(diagnostics[0]["reference"], "C1");
+        assert_eq!(diagnostics[0]["references"], serde_json::json!(["C1"]));
+        assert_eq!(diagnostics[0]["footprint_id"], STOCK_0603);
+        assert_eq!(
+            diagnostics[0]["message"],
+            format!("the schematic connects C1 pad 3, which footprint {STOCK_0603} does not have")
+        );
+    }
+
+    /// A refusal before any plan exists (saved hierarchy, netlist export, IPC
+    /// preflight) went out with a hand-built diagnostic of only `code` and
+    /// `message`, so the responses that say least were also the ones missing
+    /// the fields every other diagnostic carries. One constructor builds them
+    /// all now. The whole object is compared: indexing a missing key yields
+    /// `null` as well, so a per-field check could not tell absent from null.
+    #[tokio::test]
+    async fn a_preflight_refusal_has_the_same_diagnostic_fields_through_the_served_dispatch() {
+        let served = ServedSync::new().await;
+
+        // An export with no components section fails the netlist preflight.
+        let (is_error, refused) = served.dry_run_result("(export (version \"E\"))").await;
+
+        assert!(is_error, "{refused:#}");
+        assert_eq!(refused["status"], "conflict");
+        let message = refused["diagnostics"][0]["message"].as_str().unwrap();
+        assert!(message.starts_with("netlist preflight failed"), "{message}");
+        assert_eq!(
+            refused["diagnostics"],
+            serde_json::json!([{
+                "code": "preflight_conflict",
+                "message": message,
+                "reference": null,
+                "references": [],
+                "footprint_id": null
+            }])
+        );
+
+        // The same keys as a diagnostic from planning, so one reader serves both.
+        let planned = served
+            .dry_run(&exported_netlist(&[("U1", TEXAS_VQFN, &["1"])]))
+            .await;
+        let keys = |diagnostic: &serde_json::Value| {
+            diagnostic
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            keys(&refused["diagnostics"][0]),
+            keys(&planned["diagnostics"][0])
         );
     }
 }

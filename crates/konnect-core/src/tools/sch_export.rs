@@ -183,7 +183,9 @@ pub fn tools() -> Vec<ToolDef> {
              Defaults to a non-mutating dry run; apply requires its exact plan revision. \
              Preserves placement, routing, board-only footprints, and footprint artwork. \
              A symbol with no footprint assigned is reported under `unassigned_footprints` \
-             and the sync proceeds for every other component.",
+             and the sync proceeds for every other component. A library footprint that \
+             cannot be placed, or a connected pad its footprint does not have, makes the dry \
+             run a conflict whose diagnostics name the footprint and every part that needs it.",
             json!({
                 "type": "object",
                 "properties": {

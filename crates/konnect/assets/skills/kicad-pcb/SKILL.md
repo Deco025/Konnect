@@ -95,7 +95,11 @@ Follow this sequence for a clean PCB workflow:
    Apply only with `dry_run: false` and the exact returned
    `expected_plan_revision` value. The saved schematic hierarchy must be closed in the
    schematic editor, and the target board must be open in KiCad. A conflict is
-   non-mutating; resolve it and rerun the dry run. A successful apply is one KiCad
+   non-mutating; resolve it and rerun the dry run. A diagnostic about a library
+   footprint names that footprint and every part that needs it: when the footprint
+   cannot be placed (custom-shape pads are not supported), assign those parts a
+   footprint without them; when the schematic connects a pad the footprint does not
+   have, fix the symbol or the footprint choice. A successful apply is one KiCad
    undo entry, so Ctrl-Z reverses the whole update.
 3. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
