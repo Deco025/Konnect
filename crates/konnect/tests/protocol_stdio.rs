@@ -712,3 +712,71 @@ fn ipc_failure_kind_and_message_reach_the_client_over_stdio() {
         );
     }
 }
+
+/// Where `user_config_path()` puts the preferences file when `HOME` /
+/// `APPDATA` point at `home`.
+fn user_config_under(home: &std::path::Path) -> std::path::PathBuf {
+    let dir = if cfg!(target_os = "windows") {
+        home.join("konnect")
+    } else if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join("konnect")
+    } else {
+        home.join(".konnect")
+    };
+    dir.join("config.json")
+}
+
+/// #580 over real stdio: a user preferences file that exists and cannot be
+/// parsed is refused by the load, and the save that used to replace it with
+/// the defaults refuses too and leaves it byte-identical.
+#[test]
+fn a_malformed_user_configuration_is_refused_and_never_overwritten_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = user_config_under(tmp.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let original =
+        r#"{"kicad_cli": "D:/tools/kicad-cli.exe", "sourcing": {"avl": ["Vishay", "Murata"]},"#;
+    std::fs::write(&config, original).unwrap();
+
+    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
+    for (tool, args) in [
+        ("load_user_config", json!({})),
+        (
+            "save_user_config",
+            json!({"key_path": "ui.theme", "value": "dark"}),
+        ),
+        ("get_effective_config", json!({})),
+    ] {
+        let result = p.call_tool(tool, args);
+        assert_eq!(result["isError"], json!(true), "{tool}: {result}");
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(
+            body["error"]["kind"], "invalid_configuration",
+            "{tool}: {body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            original,
+            "{tool} left the preferences file exactly as it was"
+        );
+    }
+}
+
+/// The other half: with no preferences file the load says it answered with
+/// the defaults, leaves them on disk, and the next load reads that file.
+#[test]
+fn an_absent_user_configuration_reports_defaults_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = user_config_under(tmp.path());
+    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
+
+    let first = McpProcess::tool_body(&p.call_tool("load_user_config", json!({})));
+    assert_eq!(first["source"], "defaults", "{first}");
+    assert_eq!(first["persisted"], true, "{first}");
+    assert!(config.is_file(), "the defaults were written to {config:?}");
+
+    let second = McpProcess::tool_body(&p.call_tool("load_user_config", json!({})));
+    assert_eq!(second["source"], "file", "{second}");
+}

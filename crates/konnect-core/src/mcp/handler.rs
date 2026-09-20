@@ -2212,3 +2212,125 @@ mod client_adaptation_tests {
         assert!(!client_caches_tool_list(""));
     }
 }
+
+#[cfg(test)]
+mod config_state_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn call(handler: &McpHandler, tool: &str, arguments: Value) -> (bool, Value) {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        (
+            result["isError"] == json!(true),
+            serde_json::from_str(text).expect("tool body is JSON"),
+        )
+    }
+
+    /// #580 through the served boundary: a project configuration that exists
+    /// and cannot be parsed is a structured refusal from every tool that reads
+    /// it, and no tool that writes it replaces it with the defaults.
+    #[tokio::test]
+    async fn a_malformed_project_configuration_is_refused_and_never_overwritten() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".konnect").join("project.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = r#"{"design_rules": ["keep me"],"#;
+        std::fs::write(&config, original).unwrap();
+        let project_dir = dir.path().display().to_string();
+
+        for (tool, arguments) in [
+            ("load_project_config", json!({ "project_dir": project_dir })),
+            (
+                "save_project_config",
+                json!({ "project_dir": project_dir, "key_path": "fab.house", "value": "JLCPCB" }),
+            ),
+            (
+                "add_design_rule",
+                json!({ "project_dir": project_dir, "rule": "second", "scope": "project" }),
+            ),
+        ] {
+            let (is_error, body) = call(&handler, tool, arguments).await;
+            assert!(is_error, "{tool}: {body}");
+            assert_eq!(
+                body["error"]["kind"], "invalid_configuration",
+                "{tool}: {body}"
+            );
+            assert!(
+                body["error"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with("malformed_json:")),
+                "{tool}: {body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config).unwrap(),
+                original,
+                "{tool} left the user's file exactly as it was"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_absent_project_configuration_says_defaults_and_a_save_creates_it() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().display().to_string();
+
+        let (is_error, loaded) = call(
+            &handler,
+            "load_project_config",
+            json!({ "project_dir": project_dir }),
+        )
+        .await;
+        assert!(!is_error, "{loaded}");
+        assert_eq!(loaded["source"], "defaults", "{loaded}");
+        assert!(
+            !dir.path().join(".konnect").exists(),
+            "a load of an absent project file writes nothing"
+        );
+
+        let (is_error, saved) = call(
+            &handler,
+            "save_project_config",
+            json!({ "project_dir": project_dir, "key_path": "fab.house", "value": "JLCPCB" }),
+        )
+        .await;
+        assert!(!is_error, "{saved}");
+        assert_eq!(saved["created"], true, "{saved}");
+
+        let (_, reloaded) = call(
+            &handler,
+            "load_project_config",
+            json!({ "project_dir": project_dir }),
+        )
+        .await;
+        assert_eq!(reloaded["source"], "file", "{reloaded}");
+        assert_eq!(reloaded["config"]["fab"]["house"], "JLCPCB", "{reloaded}");
+    }
+}

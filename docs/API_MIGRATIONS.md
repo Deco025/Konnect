@@ -3,6 +3,46 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: configuration tools refuse a file they cannot use (minor release)
+
+`load_user_config`, `save_user_config`, `load_project_config`,
+`save_project_config`, `get_effective_config`, `add_design_rule` and
+`list_design_rules` treated a preferences file that failed to parse, or failed
+to read for any reason, as if it did not exist. The load answered with
+Konnect's defaults and said "User preferences loaded."; the next save then
+wrote those defaults, plus the one key being set, over the user's file (#580).
+
+A configuration file now has four states that are never merged:
+
+- **absent** — the defaults, and the response says so: `source: "defaults"`
+  (`"file"` otherwise). `load_user_config` still leaves the defaults on disk
+  for the user to edit, and reports `persisted: true|false` with
+  `persist_error` instead of discarding a failed write. `load_project_config`
+  writes nothing, as before.
+- **loaded** — unchanged.
+- **malformed** (invalid JSON, or a root that is not an object) and
+  **unreadable** (permissions, a directory at the path, invalid UTF-8) — a
+  structured refusal, `error.kind: "invalid_configuration"`, carrying `path`
+  and a `reason` starting `malformed_json:` or `unreadable:`. Nothing is
+  written. Repair or move the file and retry.
+
+The saves (`save_*_config`, `add_design_rule`) refuse in the same two states,
+keep every other key, persist with an atomic conditional write against the
+text that was read (an atomic no-clobber create when there was no file), and
+answer from the file as read back. They add `path` and `created`. A
+persistence error, including the conditional writer's `conflict`, is
+`mutation_outcome_uncertain`: that writer reports a conflict both before a
+replacement and after one whose readback differs, so the response does not
+claim nothing was written — read the file before retrying. The one no-write
+statement is a file that appears while Konnect is creating one, which is a
+`conflict`. `get_effective_config` and `list_design_rules` add `sources:
+{user, project}` (`"file"`, `"defaults"`, or `"not_configured"` when there is
+no project directory) and refuse, naming which file, rather than merge
+defaults in place of one that cannot be used.
+
+No argument changed. A caller that relied on a broken preferences file being
+silently reset must now repair or remove it.
+
 ## Unreleased: force-directed refinement refuses unsafe plans
 
 `refine_placement_force_directed` is deprecated as a recommended bulk-cleanup
