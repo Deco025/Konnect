@@ -418,11 +418,11 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `load_user_config` | Load the user's global Konnect preferences (manufacturers, fab constraints, default passives, design rules). Call at session start. |
-| `save_user_config` | Update a user preference using dot-notation, e.g. `fab_constraints.fab_house`. |
-| `load_project_config` | Load project-specific config from `<project_dir>/.konnect/project.json`. Project overrides user. |
-| `save_project_config` | Save a project-specific rule or override (same dot-notation as `save_user_config`). |
-| `get_effective_config` | Return the merged config (user defaults + project overrides). The config Claude should use for design decisions. |
+| `load_user_config` | Load the user's global Konnect preferences (manufacturers, fab constraints, default passives, design rules). Call at session start. `source` says file or defaults; a file that exists but cannot be parsed or read is refused (`invalid_configuration`), never replaced by defaults. |
+| `save_user_config` | Update a user preference using dot-notation, e.g. `fab_constraints.fab_house`. Keeps every other key, reports the file as read back, and refuses to write over a file it could not read. |
+| `load_project_config` | Load project-specific config from `<project_dir>/.konnect/project.json`. Project overrides user. `source` says file or defaults; an unusable file is refused. |
+| `save_project_config` | Save a project-specific rule or override (same dot-notation and the same refusals as `save_user_config`). |
+| `get_effective_config` | Return the merged config (user defaults + project overrides) with `sources` for each half. The config Claude should use for design decisions; refuses rather than merge defaults in place of a file that cannot be used. |
 | `add_design_rule` | Add a natural-language design rule Claude should follow. Examples: "Always use 100nF X7R for MCU decoupling within 3mm of power pin". |
 | `list_design_rules` | List all active design rules (user-level + project-level). |
 

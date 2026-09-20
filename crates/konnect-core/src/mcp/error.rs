@@ -124,6 +124,12 @@ pub enum ToolErrorKind {
     /// complete set of comparable board identities — so whether it holds this
     /// board is unknown, and neither a live edit nor a file edit is safe.
     AmbiguousOpenBoard { path: String },
+    /// A configuration file exists but cannot be used: malformed JSON, a
+    /// non-object root, or an I/O failure other than absence. Defaults are
+    /// never substituted for it, because the next save would persist them
+    /// over the user's own settings (#580). `reason` starts with
+    /// `malformed_json:` or `unreadable:`.
+    InvalidConfiguration { path: String, reason: String },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
@@ -153,6 +159,7 @@ impl ToolErrorKind {
             Self::UnresolvedCrossProbeDestination { .. } => "unresolved_cross_probe_destination",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
+            Self::InvalidConfiguration { .. } => "invalid_configuration",
             Self::HandlerError { .. } => "handler_error",
         }
     }

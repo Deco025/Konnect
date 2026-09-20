@@ -214,6 +214,26 @@ This memory is intentionally process-local. It cannot detect a KiCad crash that
 happened before the current Konnect process started. File-fallback success
 therefore carries a warning describing that cold-start limitation.
 
+## `invalid_configuration` from a config tool
+
+`load_user_config`, `get_effective_config` or a save refuses with
+`error.kind: "invalid_configuration"` when a Konnect preferences file exists
+but cannot be used. `error.path` names the file and `error.reason` starts with
+`malformed_json:` (invalid JSON, or a root that is not an object — often a
+truncated write or a hand edit) or `unreadable:` (permissions, a directory at
+that path, invalid UTF-8).
+
+Konnect used to answer with its defaults here, and the next save then replaced
+the file with them. It now refuses and writes nothing, so your settings are
+still in the file. Open it, fix the JSON (or move it aside to start again from
+the defaults), and retry. The user file is `%APPDATA%\konnect\config.json` on
+Windows, `~/Library/Application Support/konnect/config.json` on macOS and
+`~/.konnect/config.json` elsewhere; a project's is
+`<project_dir>/.konnect/project.json`.
+
+A save that ends in `mutation_outcome_uncertain` could not prove what is on
+disk. Read the file before retrying; do not assume nothing was written.
+
 ## An older schematic-to-PCB sync left extra unnamed pads
 
 Konnect versions v0.4.0 through v0.6.1 could rewrite each drawing shape inside
