@@ -129,7 +129,7 @@ and Windows servers do not.
 | `rotate_schematic_label` | Rotate a net label to a new angle and update its justify direction. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
 | `batch_rotate_labels` | Rotate multiple labels by net name in a single file read/write cycle. |
-| `add_power_symbol` | Add a power symbol (VCC, GND, etc.). Auto-numbers the internal `#PWR` reference to the lowest number free on the sheet. Preserves every saved hierarchy instance and reports committed-file readback; refuses stale instance metadata before writing. |
+| `add_power_symbol` | Add a power symbol (VCC, GND, etc.). Snaps to the 1.27mm grid like the other placers and reports the placed coordinates. Auto-numbers the internal `#PWR` reference to the lowest number free on the sheet. Preserves every saved hierarchy instance and reports committed-file readback; refuses stale instance metadata before writing. |
 | `add_no_connect` | Add a no-connect flag (X marker) to an unconnected pin endpoint. |
 | `delete_no_connect` | Remove a no-connect flag at a given position. |
 | `batch_delete_no_connect` | Delete multiple no-connect flags in a single file read/write cycle. |

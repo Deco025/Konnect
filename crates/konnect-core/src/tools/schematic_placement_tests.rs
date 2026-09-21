@@ -223,11 +223,22 @@ async fn native_placement_preserves_unique_and_reused_paths_with_committed_readb
                 assert_eq!(entry["unit"], symbol.unit);
                 if symbol.reference() == Some("U999") {
                     assert_eq!(symbol.unit, 2);
-                    assert_ne!(
-                        symbol.at.x, 100.1,
-                        "response must report grid-snapped coordinates"
+                }
+                // Every placer is handed an off-grid point (x = 100.1 or 110.1,
+                // y = 80.2). This check used to sit behind the `U999` reference,
+                // which skipped the one placer that did not snap: a power symbol
+                // is auto-numbered `#PWRnnn` (#662).
+                for (axis, placed) in [("x", symbol.at.x), ("y", symbol.at.y)] {
+                    let on_grid = konnect_sexp::geometry::snap_to_grid(placed, 1.27);
+                    assert!(
+                        (placed - on_grid).abs() < 1e-9,
+                        "{name}: {axis} = {placed} is off the 1.27 mm grid"
                     );
                 }
+                assert_ne!(
+                    symbol.at.y, 80.2,
+                    "{name}: the off-grid request was written as given"
+                );
                 if name == "add_power_symbol" {
                     assert_eq!(entry["added_power"], symbol.value_str().unwrap());
                 }
@@ -1203,4 +1214,59 @@ fn native_placement_readback_requires_requested_values() {
                 .unwrap_err();
         assert_eq!(body(&error)["error"]["kind"], "stale_target", "{mismatch}");
     }
+}
+
+/// #662 through the served boundary: an off-grid request is placed on the
+/// 1.27 mm grid, and both the response and the committed file say where.
+#[tokio::test]
+async fn a_power_symbol_is_snapped_through_the_served_dispatch() {
+    let (_directory, _root, child) = fixture(false);
+    let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+        kicad_cli: String::new(),
+        kicad_binary: String::new(),
+        ipc_address: String::new(),
+        project_dir: None,
+        jlcpcb_db_path: None,
+        auto_load_toolsets: false,
+        eager_toolsets: true,
+    })
+    .await
+    .expect("handler builds");
+
+    let response = handler
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "add_power_symbol",
+                "arguments": {
+                    "schematic": child.display().to_string(),
+                    "power_net": "GND", "x": 100.1, "y": 80.2
+                }
+            }
+        }))
+        .await
+        .expect("tools/call receives a response");
+    let result = response.result.expect("successful JSON-RPC response");
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let placed: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+
+    // 100.1 / 1.27 rounds to 79 grid steps, 80.2 / 1.27 to 63.
+    for (axis, expected) in [("x", 79.0 * 1.27), ("y", 63.0 * 1.27)] {
+        let reported = placed[axis].as_f64().unwrap();
+        assert!(
+            (reported - expected).abs() < 1e-9,
+            "{axis}: reported {reported}, expected {expected}: {placed}"
+        );
+    }
+    let committed = Schematic::load(&child).unwrap();
+    let symbol = committed
+        .symbols
+        .iter()
+        .find(|symbol| Some(symbol.uuid.as_str()) == placed["uuid"].as_str())
+        .expect("the placed symbol is in the committed file");
+    assert_eq!(placed["x"].as_f64(), Some(symbol.at.x));
+    assert_eq!(placed["y"].as_f64(), Some(symbol.at.y));
 }

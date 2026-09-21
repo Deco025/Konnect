@@ -43,6 +43,21 @@ defaults in place of one that cannot be used.
 No argument changed. A caller that relied on a broken preferences file being
 silently reset must now repair or remove it.
 
+## Unreleased: `add_power_symbol` snaps to the schematic grid (patch release)
+
+`add_schematic_component` and `batch_place_components` snap the requested
+position to KiCad's 1.27 mm schematic grid; `add_power_symbol` wrote it as
+given (#662). Wires and labels are snapped too, so a power symbol left off the
+grid could not be reached by them: ERC reported the endpoint off grid and the
+power pin unconnected.
+
+`add_power_symbol` now snaps like the other two placers. No argument or
+response field changed. `x` and `y` in the response were already read back
+from the committed file, so they now report the snapped position. A request
+that was on the grid, which includes any pin endpoint of a placed component,
+lands exactly where it did before; only an off-grid request moves, by at most
+0.635 mm on each axis.
+
 ## Unreleased: force-directed refinement refuses unsafe plans
 
 `refine_placement_force_directed` is deprecated as a recommended bulk-cleanup
