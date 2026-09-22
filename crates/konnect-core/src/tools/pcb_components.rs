@@ -23,7 +23,7 @@ use prost::Message;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
@@ -56,16 +56,22 @@ macro_rules! ipc {
 /// table, then the conventional KiCad library directories — the lookup that
 /// `library::resolve_footprint_path` owns.
 pub(crate) fn resolve_footprint_source(lib_id: &str, board: &Path) -> anyhow::Result<String> {
+    let path = resolve_footprint_file(lib_id, board)?;
+    std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))
+}
+
+/// The resolution half of [`resolve_footprint_source`], for a caller that
+/// reports "does not resolve" and "cannot be read" as different failures.
+pub(crate) fn resolve_footprint_file(lib_id: &str, board_path: &Path) -> anyhow::Result<PathBuf> {
     let (nickname, entry) = lib_id.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("footprint must use Library:Footprint syntax, got '{lib_id}'")
     })?;
     if nickname.is_empty() || entry.is_empty() {
         anyhow::bail!("footprint must use a non-empty Library:Footprint identifier");
     }
-    let path = super::library::resolve_footprint_path(lib_id, board.parent())
-        .map_err(|message| anyhow::anyhow!(message))?;
-    std::fs::read_to_string(&path)
-        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))
+    super::library::resolve_footprint_path(lib_id, board_path.parent())
+        .map_err(|message| anyhow::anyhow!(message))
 }
 
 /// Structured rejection for any back-side (`B.*`) placement layer.
