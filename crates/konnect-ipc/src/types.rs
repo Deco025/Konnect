@@ -526,6 +526,11 @@ pub struct IpcLayer {
     pub name: String,
     pub id: i32,
     pub kind: String,
+    /// The name KiCad shows for the layer, which the user may have renamed.
+    /// `None` when the enabled set was read without asking for it — an empty
+    /// string is a name KiCad could have answered with, so absence needs its
+    /// own spelling.
+    pub display_name: Option<String>,
 }
 
 /// The enabled layer set as KiCad reports it.

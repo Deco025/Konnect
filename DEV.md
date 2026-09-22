@@ -87,6 +87,8 @@ Konnect/
 │   │       │   └── meta_tools.rs    # 7 baseline meta-tools + Unix stdio reload
 │   │       └── tools/
 │   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir()
+│   │           ├── board_source.rs   # board_source selector: live-vs-saved board reads + provenance
+│   │           ├── live_board.rs     # what KiCad's answer proves about one board, shared by read and write gates
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
 │   │           ├── svg_import.rs     # SVG parsing + Bezier flattening for import_svg_logo (usvg-backed)
 │   │           ├── project.rs        # 7 tools (incl. open_schematic_viewer)
@@ -223,6 +225,34 @@ For journal diagnosis and recovery, use `konnect transaction status`,
 `konnect transaction recover`, and the explicit force-gated `konnect
 transaction abandon` escape hatch documented in
 [Troubleshooting](docs/TROUBLESHOOTING.md#transaction-recovery-is-blocked-by-divergent-content).
+
+### Which board a read answers about
+
+A read-only PCB tool that can be answered by either KiCad or the saved file
+asks `tools/board_source.rs` rather than choosing for itself. It advertises a
+`board_source` argument — `auto` (default), `live`, `saved` — and reports
+observed provenance beside the answer: a `sources` object naming the origin of
+each domain (`ipc`, `saved_board`, `project_file`, `derived`, `unavailable`)
+and a `source_evidence` object carrying `board_state`,
+`excludes_unsaved_editor_state`, a machine-readable `reason` and its prose
+`detail`.
+
+Both it and the write gates in `pcb_board.rs` read KiCad's answer through
+`tools/live_board.rs`, which owns the classification itself — including the
+rule that a board this process watched KiCad hold is never treated as safely
+absent afterwards, however KiCad stops answering (#240). The policies differ on
+purpose (a stale read is disclosable, a stale write destroys work); the reading
+of the evidence does not.
+
+The rule the seam exists to hold: once KiCad has positively identified the
+requested board as live, a failed query is **returned as a failure**. It never
+becomes a successful answer read off a file that may be older than the editor's
+unsaved state. A board this process watched KiCad hold, whose IPC endpoint then
+disappears, is refused under `auto` for the same reason. An explicit `saved`
+request may still inspect that snapshot, and says so in its `reason`.
+
+`get_layer_list` and `get_netclasses` are the first consumers (#542). The
+broader per-tool inventory is tracked in #574.
 
 ### kicad-cli v10 (Subprocess)
 - Verified commands: `sch erc`, `sch export svg/pdf/bom/netlist`, `pcb drc`, `pcb export gerbers/drill/pdf/svg/step/vrml/pos/ipcd356`, `pcb render`

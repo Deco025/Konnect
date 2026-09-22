@@ -36,7 +36,10 @@ the editor with a file edit.
 earlier in the current server session but IPC is now unreachable, so the saved file may
 be older than lost editor state. Pause mutation work, tell the user that Konnect left
 the file unchanged, and ask them to reopen/recover, reconcile, and save the board in
-KiCad. Continue through live IPC afterward. Preserve the guard: do not retry-loop,
+KiCad. A read-only tool taking `board_source` can return the same kind, where nothing
+was going to be written: reporting the saved file as current would be the unsafe act.
+There, `board_source: "saved"` inspects that snapshot deliberately and says what it
+excludes — offer it instead of retrying the default. Continue through live IPC afterward. Preserve the guard: do not retry-loop,
 restart Konnect automatically, or edit `.kicad_pcb` directly. If the user confirms a
 clean close and an authoritative saved file, they may restart Konnect to deliberately
 begin a new closed-board session.

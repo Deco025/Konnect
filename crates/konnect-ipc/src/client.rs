@@ -17,6 +17,27 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
+/// How long the per-layer name lookups behind `get_enabled_layers_with_names_in`
+/// may wait on KiCad in total. One socket and one round trip each, and up to
+/// 32 enabled layers: at the default receive timeout, a KiCad that wedges
+/// mid-loop would hold a read for a quarter of an hour. The names are
+/// cosmetic, so the budget stops the loop and the canonical names stand.
+///
+/// The budget is a wall-clock bound on the waiting, not just on when the last
+/// lookup may start: each lookup is sent with whatever is left of it as its own
+/// receive timeout, so the one that runs out of budget gives up at the deadline
+/// instead of falling back on [`COMMAND_RECV_TIMEOUT`].
+const LAYER_NAME_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a command waits for KiCad's reply when the caller has no deadline
+/// of its own. Long enough for slow board operations like a zone refill.
+const COMMAND_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a command waits to hand its request to the transport. The socket
+/// is already dialed by then, so this only bounds a send queue that will not
+/// drain.
+const COMMAND_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Converts KiCAD nanometers to millimeters.
 fn nm_to_mm(nm: i64) -> f64 {
     nm as f64 / 1_000_000.0
@@ -836,6 +857,20 @@ impl KiCadIpcClient {
         command: &impl Message,
         type_name: &str,
     ) -> Result<Option<prost_types::Any>> {
+        self.send_command_within(command, type_name, COMMAND_RECV_TIMEOUT)
+    }
+
+    /// As [`Self::send_command`], for a caller whose own deadline is shorter
+    /// than [`COMMAND_RECV_TIMEOUT`]: `recv_timeout` is how long this one call
+    /// may wait for KiCad's reply. Timing out that way is an ordinary reply
+    /// failure, not a [`TransportUnreachable`] one — the caller ran out of
+    /// patience, which is no evidence about the endpoint.
+    fn send_command_within(
+        &self,
+        command: &impl Message,
+        type_name: &str,
+        recv_timeout: std::time::Duration,
+    ) -> Result<Option<prost_types::Any>> {
         if self.socket_path.is_empty() {
             return Err(unreachable_error(
                 UnreachableReason::NotConfigured,
@@ -874,13 +909,14 @@ impl KiCadIpcClient {
         // Bound every step: a busy or wedged KiCAD must produce an error the
         // tools can surface, never an indefinite hang (the predecessor
         // project's sync/autoroute hangs blocked for >600 s on exactly this).
-        // 30 s receive allows slow board operations like zone refills.
+        // The receive bound is the caller's, so a caller on a deadline gets
+        // its own answer back by then rather than this command's default.
         use nng::options::Options;
         socket
-            .set_opt::<nng::options::SendTimeout>(Some(std::time::Duration::from_secs(5)))
+            .set_opt::<nng::options::SendTimeout>(Some(COMMAND_SEND_TIMEOUT))
             .context("Failed to set NNG send timeout")?;
         socket
-            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(30)))
+            .set_opt::<nng::options::RecvTimeout>(Some(recv_timeout))
             .context("Failed to set NNG receive timeout")?;
 
         // Build the dial URL. inproc:// is same-process only — used by the
@@ -3558,11 +3594,12 @@ impl KiCadIpcClient {
             board: Some(document),
         };
         let resp_any = self.send_command(&cmd, "kiapi.board.commands.GetBoardEnabledLayers")?;
+        // No board has zero enabled layers — Edge.Cuts and the courtyards
+        // cannot be disabled. An `AS_OK` with no body is KiCad declining to
+        // answer, and returning it as an empty stackup would report that
+        // non-answer as the board's live layer set.
         let Some(any) = resp_any else {
-            return Ok(IpcEnabledLayers {
-                copper_layer_count: 0,
-                layers: vec![],
-            });
+            anyhow::bail!("KiCad returned no enabled-layer set for the requested board");
         };
         let resp: kiapi::board::commands::BoardEnabledLayersResponse = unpack_any(&any)?;
         let layers = resp
@@ -3579,6 +3616,7 @@ impl KiCadIpcClient {
                         .to_string(),
                     id: l,
                     kind: String::new(),
+                    display_name: None,
                 }
             })
             .collect();
@@ -3586,6 +3624,107 @@ impl KiCadIpcClient {
             copper_layer_count: resp.copper_layer_count,
             layers,
         })
+    }
+
+    /// As [`Self::get_enabled_layers_in`], also resolving the name KiCad shows
+    /// for each layer, within [`LAYER_NAME_BUDGET`].
+    ///
+    /// `GetBoardEnabledLayers` answers with layer ids only, and the name a user
+    /// sees may be a rename held in the editor. `GetBoardLayerName` is the only
+    /// command that knows it, and it takes one layer per call, so the round
+    /// trips are KiCad's shape rather than a choice.
+    pub fn get_enabled_layers_with_names_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<IpcEnabledLayers> {
+        self.get_enabled_layers_named_within(document, LAYER_NAME_BUDGET)
+    }
+
+    /// The same, with an explicit budget for the name lookups — for a caller
+    /// on a tighter deadline than [`LAYER_NAME_BUDGET`], and for tests, which
+    /// can exhaust it without waiting on a wedged KiCad.
+    ///
+    /// `budget` bounds the waiting, not merely the starting: the lookups stop
+    /// once it is spent, and each one that does start waits at most what is
+    /// left of it.
+    pub fn get_enabled_layers_named_within(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        budget: std::time::Duration,
+    ) -> Result<IpcEnabledLayers> {
+        let mut enabled = self.get_enabled_layers_in(document.clone())?;
+        let deadline = std::time::Instant::now() + budget;
+        for (resolved, layer) in enabled.layers.iter_mut().enumerate() {
+            // Every command opens its own socket, and each one of these is a
+            // whole round trip, so at the default receive timeout a KiCad that
+            // stops answering partway through a full stackup would hold this
+            // read for a quarter of an hour. The names are a nicety — the
+            // canonical name is always there — so they get a budget.
+            //
+            // The budget has to be the receive timeout too, not just the
+            // gate on starting another lookup: a lookup begun a millisecond
+            // before the deadline would otherwise wait out the default
+            // 30 s on its own, and overrun the bound by three times over.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    named = resolved,
+                    unnamed = enabled.layers.len() - resolved,
+                    budget_secs = budget.as_secs_f64(),
+                    "KiCad is answering layer-name lookups too slowly; reporting the canonical \
+                     name for the rest"
+                );
+                break;
+            }
+            match self.get_board_layer_name_within(document.clone(), layer.id, remaining) {
+                Ok(name) => layer.display_name = Some(name),
+                // A KiCad that declines one layer's name has still answered,
+                // and the enabled set it gave is good. Leaving `display_name`
+                // unset says so, and beats failing a whole live read over one
+                // cosmetic lookup — callers fall back to the canonical name.
+                Err(error) if !crate::is_transport_unreachable(&error) => {
+                    tracing::warn!(
+                        layer = layer.id,
+                        error = %error,
+                        "KiCad did not name this board layer; reporting its canonical name"
+                    );
+                }
+                // A transport that died mid-loop is different in kind: the
+                // editor may be gone, so the partial read must not be dressed
+                // up as a complete live answer.
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(enabled)
+    }
+
+    /// The name KiCad shows for one layer of an open board — the canonical
+    /// spelling, or the user's rename of it.
+    pub fn get_board_layer_name_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        layer: i32,
+    ) -> Result<String> {
+        self.get_board_layer_name_within(document, layer, COMMAND_RECV_TIMEOUT)
+    }
+
+    /// As [`Self::get_board_layer_name_in`], waiting at most `recv_timeout`
+    /// for the reply — the remaining share of a caller's naming budget.
+    fn get_board_layer_name_within(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        layer: i32,
+        recv_timeout: std::time::Duration,
+    ) -> Result<String> {
+        let cmd = kiapi::board::commands::GetBoardLayerName {
+            board: Some(document),
+            layer,
+        };
+        let resp: kiapi::board::commands::BoardLayerNameResponse = unpack_required(
+            self.send_command_within(&cmd, "kiapi.board.commands.GetBoardLayerName", recv_timeout)?,
+            "GetBoardLayerName",
+        )?;
+        Ok(resp.name)
     }
 
     /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).

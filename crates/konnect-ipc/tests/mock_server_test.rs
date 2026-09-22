@@ -2720,3 +2720,170 @@ fn invalid_selection_mutations_are_rejected_before_transport() {
         );
     }
 }
+
+/// The per-layer name lookups are cosmetic, and each one is a whole round trip.
+/// A KiCad that answers the enabled set and then slows to a crawl must not hold
+/// the read for a quarter of an hour, so the loop stops when its budget is
+/// spent and the canonical names stand. The budget bounds the waiting, not just
+/// the starting: a lookup begun just under the deadline waits only what is left
+/// of the budget, never the client's default receive timeout.
+mod layer_name_budget {
+    use super::*;
+
+    /// Counts the name lookups, so a test can prove the loop stopped rather
+    /// than inferring it from the absence of names.
+    fn spawn_kicad_naming_layers(asked: Arc<Mutex<usize>>) -> MockKicad {
+        spawn_kicad_naming_layers_after(asked, Duration::ZERO)
+    }
+
+    /// The same, with KiCad taking `delay` to answer each name lookup — a
+    /// KiCad that has slowed to a crawl without dying.
+    fn spawn_kicad_naming_layers_after(asked: Arc<Mutex<usize>>, delay: Duration) -> MockKicad {
+        spawn_mock(move |request| {
+            let command = request.message.expect("a command");
+            if command.type_url.ends_with("GetBoardEnabledLayers") {
+                return Some(reply_with(builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        layers: vec![
+                            kiapi::board::types::BoardLayer::BlFCu as i32,
+                            kiapi::board::types::BoardLayer::BlBCu as i32,
+                        ],
+                        copper_layer_count: 2,
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                )));
+            }
+            if command.type_url.ends_with("GetBoardLayerName") {
+                *asked.lock().unwrap() += 1;
+                std::thread::sleep(delay);
+                return Some(reply_with(builders::pack_any(
+                    &kiapi::board::commands::BoardLayerNameResponse {
+                        name: "renamed in the editor".to_string(),
+                    },
+                    "kiapi.board.commands.BoardLayerNameResponse",
+                )));
+            }
+            Some(ok_response())
+        })
+    }
+
+    #[test]
+    fn a_spent_budget_stops_the_lookups_and_keeps_the_enabled_set() {
+        let asked = Arc::new(Mutex::new(0));
+        let server = spawn_kicad_naming_layers(asked.clone());
+        let client = KiCadIpcClient::new(&server.url);
+
+        let enabled = client
+            .get_enabled_layers_named_within(doc_for("test.kicad_pcb"), Duration::ZERO)
+            .expect("the enabled set is KiCad's answer, not a casualty of the budget");
+
+        assert_eq!(*asked.lock().unwrap(), 0, "no name was worth asking for");
+        assert_eq!(enabled.copper_layer_count, 2);
+        let names: Vec<_> = enabled.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["F.Cu", "B.Cu"]);
+        assert!(
+            enabled.layers.iter().all(|l| l.display_name.is_none()),
+            "the canonical name stands in when the budget is spent"
+        );
+    }
+
+    #[test]
+    fn a_budget_with_room_resolves_every_name() {
+        let asked = Arc::new(Mutex::new(0));
+        let server = spawn_kicad_naming_layers(asked.clone());
+        let client = KiCadIpcClient::new(&server.url);
+
+        let enabled = client
+            .get_enabled_layers_named_within(doc_for("test.kicad_pcb"), Duration::from_secs(30))
+            .expect("KiCad answered everything");
+
+        assert_eq!(*asked.lock().unwrap(), 2);
+        assert!(enabled
+            .layers
+            .iter()
+            .all(|l| l.display_name.as_deref() == Some("renamed in the editor")));
+    }
+
+    /// The bound the budget advertises is wall clock, so the test measures
+    /// wall clock. KiCad here answers the enabled set at once and then takes
+    /// far longer than the budget over the first name. Waiting for that reply
+    /// is the overrun: the client's own receive timeout is 30 s, so a lookup
+    /// that falls back on it blows a sub-second budget by two orders of
+    /// magnitude while still "stopping" at the deadline afterwards.
+    #[test]
+    fn a_lookup_started_under_the_deadline_still_stops_at_it() {
+        const BUDGET: Duration = Duration::from_millis(400);
+        // Long enough that a reply cannot be what ends the wait, and far below
+        // the 30 s the lookup would otherwise settle for.
+        const KICAD_TAKES: Duration = Duration::from_secs(8);
+
+        let asked = Arc::new(Mutex::new(0));
+        let server = spawn_kicad_naming_layers_after(asked.clone(), KICAD_TAKES);
+        let client = KiCadIpcClient::new(&server.url);
+
+        let started = std::time::Instant::now();
+        let enabled = client
+            .get_enabled_layers_named_within(doc_for("test.kicad_pcb"), BUDGET)
+            .expect("a slow name lookup is not a failed live read");
+        let elapsed = started.elapsed();
+
+        // Generous against a loaded CI runner, and still nowhere near either
+        // KiCad's reply or the default receive timeout.
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the naming loop waited {elapsed:?}, past its {BUDGET:?} budget"
+        );
+        assert!(
+            elapsed < KICAD_TAKES,
+            "the loop waited for KiCad's reply ({elapsed:?}) instead of giving up at its budget"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            1,
+            "the first lookup started inside the budget; the second must not have"
+        );
+        assert_eq!(enabled.copper_layer_count, 2);
+        let names: Vec<_> = enabled.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["F.Cu", "B.Cu"], "the enabled set is still KiCad's");
+        assert!(
+            enabled.layers.iter().all(|l| l.display_name.is_none()),
+            "a name KiCad never delivered is not a name"
+        );
+    }
+
+    /// The remaining budget, not a fresh copy of it, bounds each lookup. KiCad
+    /// here answers each name in well under the budget, so nothing is slow
+    /// enough to stop on its own; what stops the second lookup is that the
+    /// first already spent most of what there was. A budget renewed per call
+    /// would name both layers.
+    #[test]
+    fn the_budget_is_spent_across_the_lookups_not_renewed_by_each() {
+        const KICAD_TAKES: Duration = Duration::from_millis(300);
+        const BUDGET: Duration = Duration::from_millis(500);
+
+        let asked = Arc::new(Mutex::new(0));
+        let server = spawn_kicad_naming_layers_after(asked.clone(), KICAD_TAKES);
+        let client = KiCadIpcClient::new(&server.url);
+
+        let started = std::time::Instant::now();
+        let enabled = client
+            .get_enabled_layers_named_within(doc_for("test.kicad_pcb"), BUDGET)
+            .expect("a budget spent mid-loop is not a failed live read");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            enabled.layers.len(),
+            2,
+            "the enabled set is KiCad's, whatever the budget bought"
+        );
+        assert!(
+            enabled.layers[1].display_name.is_none(),
+            "the first lookup left under {KICAD_TAKES:?} of the budget, so the second could \
+             not have been answered"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the loop took {elapsed:?}: the second lookup waited past the budget"
+        );
+    }
+}

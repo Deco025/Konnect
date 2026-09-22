@@ -6,6 +6,7 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::board_source::{self, BoardSource};
 use crate::tools::{
     get_path, opt_f64, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
 };
@@ -247,25 +248,30 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_netclasses",
             "Read every netclass in the project's design rules, with its settings, \
-             its netclass_patterns and the board nets those patterns match. Reads \
-             the sibling .kicad_pro and the board file; KiCad need not be running. \
-             Call before create_netclass to see what a class holds — an update \
-             changes only the values you name, and this is the only way to see the \
-             rest. A net can match several classes: KiCad takes each property from \
-             the highest-priority class that sets it (lower number = higher \
-             priority) and falls back to Default. Settings are reported \
+             its netclass_patterns and the board nets those patterns match. The \
+             answer is mixed-source and says so in 'sources': definitions and \
+             patterns always come from the sibling .kicad_pro, while the board nets \
+             come from the board KiCad holds open where it can and from the saved \
+             board file otherwise ('board_source' selects that); KiCad need not be \
+             running. Call before create_netclass to see what a class holds — an \
+             update changes only the values you name, and this is the only way to \
+             see the rest. A net can match several classes: KiCad takes each \
+             property from the highest-priority class that sets it (lower number = \
+             higher priority) and falls back to Default. Settings are reported \
              resolved, with 'inherits' naming the ones a class takes from the \
              Default rather than setting itself; 'missing_fields' on the \
              Default names settings nothing can resolve.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is read" }
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is read" },
+                    "board_source": board_source::board_source_schema()
                 },
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_netclasses(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "assign_net_to_class",
             "Assign a net to an existing netclass, as a netclass_patterns entry in \
@@ -1550,11 +1556,32 @@ const NETCLASS_FIELDS: [(&str, &str); 4] = [
     ("via_diameter", "via_diameter"),
 ];
 
+/// Every distinct net the saved board names, sorted.
+///
+/// Read with `collect_net_keys`, not `find_all("net")` — KiCad 10 writes no
+/// top-level net table at all, so a direct-children scan finds zero nets on
+/// every current board and every pattern would match nothing.
+fn saved_net_names(board_path: &std::path::Path) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(board_path)
+        .map_err(|e| format!("board could not be read ({e})"))?;
+    let tree =
+        konnect_sexp::parse_sexp(&text).map_err(|e| format!("board could not be parsed ({e})"))?;
+    let mut names: Vec<String> = konnect_sexp::net::collect_net_keys(&tree)
+        .into_iter()
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
 async fn handle_get_netclasses(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
+    let source = match BoardSource::from_args(args) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
+    };
     let (pro, settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
@@ -1569,34 +1596,49 @@ async fn handle_get_netclasses(
         .cloned()
         .unwrap_or_default();
 
-    // The nets come from the board file rather than IPC: this is a read-only
-    // query that must answer with KiCad closed. They are read with
-    // `collect_net_keys`, not `find_all("net")` — KiCad 10 writes no top-level
-    // net table at all, so a direct-children scan finds zero nets on every
-    // current board and every pattern would match nothing. A board held open
-    // with unsaved edits reads as last saved, which the payload says out loud.
-    let (net_names, nets_note): (Vec<String>, String) = match std::fs::read_to_string(&board_path) {
-        Ok(text) => match konnect_sexp::parse_sexp(&text) {
-            Ok(tree) => {
-                let mut names: Vec<String> = konnect_sexp::net::collect_net_keys(&tree)
-                    .into_iter()
-                    .collect();
-                names.sort();
-                (
+    // Only the board nets have two possible sources. Definitions and patterns
+    // are project-file facts KiCad's IPC API has no complete equivalent for, so
+    // they are read from `.kicad_pro` either way and reported as such.
+    let observation =
+        board_source::read_board(ctx, &board_path, source, "net list", |client, document| {
+            client.get_nets_in(document)
+        })
+        .await?;
+    let (net_names, nets_source, nets_note, evidence) = match observation {
+        board_source::BoardRead::Refused(refusal) => return Ok(refusal),
+        board_source::BoardRead::Live(nets) => {
+            // KiCad reports the unconnected pseudo-net as an empty name. It is
+            // not a net a user has, and the saved-file reader drops it too.
+            let mut names: Vec<String> = nets
+                .into_iter()
+                .map(|net| net.name)
+                .filter(|name| !name.is_empty())
+                .collect();
+            names.sort();
+            names.dedup();
+            (
+                names,
+                board_source::FROM_IPC,
+                "live board in KiCad, read over its IPC API; unsaved edits are included"
+                    .to_string(),
+                board_source::live_evidence(),
+            )
+        }
+        board_source::BoardRead::Saved(why) => {
+            let (names, source, note) = match saved_net_names(&board_path) {
+                Ok(names) => (
                     names,
-                    "board file as last saved; unsaved edits in a running KiCad are not visible"
-                        .to_string(),
-                )
-            }
-            Err(e) => (
-                Vec::new(),
-                format!("board could not be parsed ({e}); nets unavailable"),
-            ),
-        },
-        Err(e) => (
-            Vec::new(),
-            format!("board could not be read ({e}); nets unavailable"),
-        ),
+                    board_source::FROM_SAVED_BOARD,
+                    format!("board file as last saved. {}", why.detail()),
+                ),
+                Err(reason) => (
+                    Vec::new(),
+                    board_source::FROM_UNAVAILABLE,
+                    format!("{reason}; nets unavailable. {}", why.detail()),
+                ),
+            };
+            (names, source, note, why.evidence())
+        }
     };
 
     // What an omitted key resolves to. A Default in the file is the whole
@@ -1695,7 +1737,7 @@ async fn handle_get_netclasses(
     // net, taking each property from the highest-priority class that sets it,
     // with Default filling what is left. Naming one winning class per net
     // would be a fiction, so the mapping is reported as it is.
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "file": pro.display().to_string(),
         "count": out.len(),
         "netclasses": out,
@@ -1705,7 +1747,18 @@ async fn handle_get_netclasses(
         "note": "A net can match several classes; KiCad then takes each property from the \
                  highest-priority class that sets it and falls back to Default. Lower \
                  priority numbers rank higher.",
-    })))
+    });
+    board_source::provenance(
+        &mut body,
+        json!({
+            "definitions": board_source::FROM_PROJECT_FILE,
+            "patterns": board_source::FROM_PROJECT_FILE,
+            "board_nets": nets_source,
+            "matched_nets": board_source::FROM_DERIVED,
+        }),
+        evidence,
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_assign_net_to_class(

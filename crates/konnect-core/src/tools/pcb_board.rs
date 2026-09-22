@@ -9,6 +9,8 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::board_source::{self, BoardSource};
+use crate::tools::live_board::{self, LiveBoard};
 use crate::tools::{
     get_path, opt_str_list, require_f64, require_str, with_board_ipc_classified, ToolContext,
     ToolDef,
@@ -277,49 +279,63 @@ where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
-    match with_board_ipc_classified(ctx, board_path, f).await? {
-        Ok(value) => Ok(BoardWrite::Ipc(value)),
-        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
-            Ok(BoardWrite::Refused(CallToolResult::error(format!(
-                "KiCAD rejected the {what} over IPC: {message}. \
+    Ok(
+        match live_board::observe(ctx, board_path, move |client, _| f(client)).await? {
+            LiveBoard::Answered(value) => BoardWrite::Ipc(value),
+            // An endpoint that served no board is mapped exactly as a
+            // rejection, which is what it was before those cases had names —
+            // `observed_live` and `absence` deliberately unread here. Whether
+            // a write should instead treat a proven-absent editor as
+            // permission is #577's question, not this one's.
+            LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
+                BoardWrite::Refused(CallToolResult::error(format!(
+                    "KiCAD rejected the {what} over IPC: {message}. \
                  The board file was not modified — KiCAD is reachable and may hold this \
                  board open, so editing the file directly could be silently overwritten."
-            ))))
-        }
-        Err(konnect_ipc::IpcFailure::Target { error, message }) if error.proves_not_open() => {
-            if ctx.board_session.was_observed_live(board_path) {
-                Ok(BoardWrite::Refused(unsafe_file_fallback(
-                    board_path,
-                    "board_previously_observed_live",
-                    "Konnect previously reached KiCad with this board open, and KiCad no longer \
-                     has it open.",
                 )))
-            } else {
-                Ok(BoardWrite::File(NoLiveBoard::NotOpen(message)))
             }
-        }
-        Err(konnect_ipc::IpcFailure::Target { error, .. }) => Ok(BoardWrite::Refused(
-            crate::tools::ipc_target_error_result(&error),
-        )),
-        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
-            if let Some(refusal) = board_lock_refusal(board_path) {
-                Ok(BoardWrite::Refused(refusal))
-            } else if ctx.board_session.was_observed_live(board_path) {
-                Ok(BoardWrite::Refused(unsafe_file_fallback(
-                    board_path,
-                    "board_previously_observed_live",
-                    "Konnect previously reached KiCad with this board open, but IPC is now \
-                     unreachable.",
-                )))
-            } else {
-                Ok(BoardWrite::File(NoLiveBoard::Unreachable))
+            LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
+            LiveBoard::Unresolved(error) => {
+                BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
             }
-        }
-    }
+            // A lock outranks the never-reached verdict: it is persistent evidence
+            // that an editor may hold newer state even where no IPC session ever did.
+            LiveBoard::NeverReached(_) => match board_lock_refusal(board_path) {
+                Some(refusal) => BoardWrite::Refused(refusal),
+                None => BoardWrite::File(NoLiveBoard::Unreachable),
+            },
+            // A lock outranks this verdict too, but only when the transport is
+            // what went away: it is then the more specific evidence, and
+            // `reason` is machine-readable, so which one a client sees must not
+            // depend on how the arms were folded.
+            LiveBoard::LostAfterObservation {
+                situation,
+                ipc_unreachable,
+            } => BoardWrite::Refused(lost_board_refusal(board_path, situation, ipc_unreachable)),
+        },
+    )
 }
 
-/// The refusal both gates share. `reason` is stable machine-readable evidence;
-/// `situation` explains that evidence and the recovery boundary to a person.
+/// A board observed live and now out of reach. When the transport is what
+/// went away, a sibling lock is the more specific evidence and names itself in
+/// `reason` — which is machine-readable, so which one a client sees must not
+/// depend on how the gate folded its arms.
+fn lost_board_refusal(
+    board_path: &std::path::Path,
+    situation: &str,
+    ipc_unreachable: bool,
+) -> CallToolResult {
+    ipc_unreachable
+        .then(|| board_lock_refusal(board_path))
+        .flatten()
+        .unwrap_or_else(|| {
+            unsafe_file_fallback(board_path, live_board::PREVIOUSLY_OBSERVED_LIVE, situation)
+        })
+}
+
+/// The refusal both write gates share. `reason` is stable machine-readable
+/// evidence; `situation` explains that evidence and the recovery boundary to
+/// a person.
 fn unsafe_file_fallback(
     board_path: &std::path::Path,
     reason: &str,
@@ -344,19 +360,16 @@ fn unsafe_file_fallback(
 /// contents do not prove process ownership or freshness, so both an observed
 /// lock and an inspection failure veto the unreachable-IPC file fallback.
 fn board_lock_refusal(board_path: &std::path::Path) -> Option<CallToolResult> {
-    board_lock_refusal_with(board_path, |path| {
-        std::fs::symlink_metadata(path).map(|_| ())
-    })
+    board_lock_refusal_from(board_path, live_board::editor_lock(board_path))
 }
 
-fn board_lock_refusal_with(
+fn board_lock_refusal_from(
     board_path: &std::path::Path,
-    inspect: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    observed: live_board::EditorLock,
 ) -> Option<CallToolResult> {
-    let lock_path = konnect_sexp::writer::kicad_editor_lock_path(board_path)?;
-    match inspect(&lock_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Ok(()) => Some(unsafe_file_fallback(
+    match observed {
+        live_board::EditorLock::Absent => None,
+        live_board::EditorLock::Present(lock_path) => Some(unsafe_file_fallback(
             board_path,
             "kicad_lock_present",
             &format!(
@@ -365,7 +378,7 @@ fn board_lock_refusal_with(
                 lock_path.display()
             ),
         )),
-        Err(error) => Some(unsafe_file_fallback(
+        live_board::EditorLock::Unreadable(lock_path, error) => Some(unsafe_file_fallback(
             board_path,
             "kicad_lock_unreadable",
             &format!(
@@ -390,39 +403,30 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
     board_path: &std::path::Path,
     what: &str,
 ) -> anyhow::Result<Option<CallToolResult>> {
-    match with_board_ipc_classified(ctx, board_path, |_| Ok(())).await? {
-        Ok(()) => Ok(Some(CallToolResult::error(format!(
-            "KiCAD currently holds this board open, and a {what} written to the file would \
-             be discarded by KiCAD's next save. Close the board in KiCAD (or make the edit \
-             there) and retry — this tool has no IPC path for a live board yet."
-        )))),
-        Err(konnect_ipc::IpcFailure::Rejected(_)) => Ok(None),
-        Err(konnect_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {
-            Ok(ctx.board_session.was_observed_live(board_path).then(|| {
-                unsafe_file_fallback(
-                    board_path,
-                    "board_previously_observed_live",
-                    "Konnect previously reached KiCad with this board open, and KiCad no longer \
-                     has it open.",
-                )
-            }))
-        }
-        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
-            Ok(Some(crate::tools::ipc_target_error_result(&error)))
-        }
-        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
-            Ok(board_lock_refusal(board_path).or_else(|| {
-                ctx.board_session.was_observed_live(board_path).then(|| {
-                    unsafe_file_fallback(
-                        board_path,
-                        "board_previously_observed_live",
-                        "Konnect previously reached KiCad with this board open, but IPC is now \
-                         unreachable.",
-                    )
-                })
-            }))
-        }
-    }
+    Ok(
+        match live_board::observe(ctx, board_path, |_, _| Ok(())).await? {
+            LiveBoard::Answered(()) => Some(CallToolResult::error(format!(
+                "KiCAD currently holds this board open, and a {what} written to the file would \
+                 be discarded by KiCAD's next save. Close the board in KiCAD (or make the edit \
+                 there) and retry — this tool has no IPC path for a live board yet."
+            ))),
+            // KiCad answered at all, so it may hold this board; a rejection is
+            // not the proof of absence this guard needs, and it is not proof of
+            // presence either. It refuses nothing.
+            //
+            // An endpoint that served no board lands here for the same reason
+            // it does in `attempt_ipc_write`: preserved as it was before those
+            // cases had names, not decided. These two gates disagree about what
+            // it permits, and that disagreement is #577's to settle.
+            LiveBoard::Rejected(_) | LiveBoard::Unserved { .. } | LiveBoard::NotOpen { .. } => None,
+            LiveBoard::Unresolved(error) => Some(crate::tools::ipc_target_error_result(&error)),
+            LiveBoard::NeverReached(_) => board_lock_refusal(board_path),
+            LiveBoard::LostAfterObservation {
+                situation,
+                ipc_unreachable,
+            } => Some(lost_board_refusal(board_path, situation, ipc_unreachable)),
+        },
+    )
 }
 
 // ─── Zone construction, shared by `add_zone` and its `add_copper_pour` alias ──
@@ -1091,16 +1095,22 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_layer_list",
-            "Return all layers defined in the board with their names and types.",
+            "Return the board's enabled layers with their names and types. Reads the \
+             board KiCad holds open where it can, so an unsaved stackup change is \
+             visible; 'board_source' selects that. A layer's id and its \
+             signal/power/user type have no KiCad IPC equivalent and stay file-backed, \
+             so 'sources' reports where each part of the answer came from.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" }
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "board_source": board_source::board_source_schema()
                 },
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_layer_list(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "add_layer",
             "Add a new inner copper or technical layer to the board layer stack.",
@@ -1659,38 +1669,161 @@ async fn handle_get_board_extents(
     })))
 }
 
-async fn handle_get_layer_list(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
-    let content = std::fs::read_to_string(&board_path)?;
-    let tree = parse_sexp(&content)?;
-
+/// The stackup as the saved board file declares it, or why it could not be
+/// read. A live answer still wants this: KiCad's IPC API reports which layers
+/// are enabled and what each is called, but not a layer's `signal`/`power`/
+/// `user` type, which stays file-backed and is reported as such.
+fn saved_stackup(board_path: &std::path::Path) -> Result<Vec<konnect_sexp::layers::Layer>, String> {
+    let content = std::fs::read_to_string(board_path).map_err(|e| format!("{e}"))?;
+    let tree = parse_sexp(&content).map_err(|e| format!("{e}"))?;
     if tree.find("layers").is_none() {
-        return Ok(CallToolResult::error(
-            "No (layers) section found in board file",
-        ));
+        return Err("no (layers) section in the board file".to_string());
     }
+    Ok(konnect_sexp::layers::layers(&tree))
+}
 
-    // Each child of layers looks like: (0 "F.Cu" signal). The ordinal is the
-    // head of the list, so the fields sit one place earlier than the accessors
-    // used to assume — and find_all("") never returned any of them anyway.
-    let layers: Vec<serde_json::Value> = konnect_sexp::layers::layers(&tree)
-        .into_iter()
-        .map(|l| {
-            json!({
-                "id": l.id,
-                "name": l.name,
-                "type": l.kind,
-                "user_name": l.user_name,
-                "copper": l.is_copper(),
-            })
+/// One reported layer. `on_file` is the matching `(layers …)` entry, which
+/// carries the ordinal id and the type KiCad's IPC API does not expose —
+/// absent for a layer the live editor has enabled that the file does not
+/// carry, so those read `null` rather than being quietly invented.
+fn layer_json(
+    name: &str,
+    display_name: &str,
+    on_file: Option<&konnect_sexp::layers::Layer>,
+) -> serde_json::Value {
+    json!({
+        "id": on_file.map(|saved| saved.id),
+        "name": name,
+        "display_name": display_name,
+        "type": on_file.map(|saved| saved.kind.clone()),
+        "user_name": on_file.and_then(|saved| saved.user_name.clone()),
+        "copper": konnect_sexp::layers::is_copper_name(name),
+    })
+}
+
+/// The `get_layer_list` payload. One builder, so the response shape cannot
+/// depend on which board source answered.
+fn layer_list_body(
+    layers: Vec<serde_json::Value>,
+    copper_layer_count: usize,
+    sources: serde_json::Value,
+    evidence: serde_json::Value,
+    note: Option<String>,
+) -> CallToolResult {
+    let mut body = json!({
+        "count": layers.len(),
+        "copper_layer_count": copper_layer_count,
+        "layers": layers,
+    });
+    board_source::provenance(&mut body, sources, evidence);
+    if let Some(note) = note {
+        body["file_backed_fields_note"] = json!(note);
+    }
+    CallToolResult::json(&body)
+}
+
+/// The saved stackup, reported as itself.
+fn saved_layer_list(
+    board_path: &std::path::Path,
+    why: &board_source::SavedBoard,
+) -> CallToolResult {
+    let stack = match saved_stackup(board_path) {
+        Ok(stack) => stack,
+        Err(reason) => {
+            return CallToolResult::error(format!(
+                "The layer list could not be read from '{}': {reason}.",
+                board_path.display()
+            ))
+        }
+    };
+    let layers: Vec<serde_json::Value> = stack
+        .iter()
+        .map(|layer| {
+            let display_name = layer.user_name.as_deref().unwrap_or(&layer.name);
+            layer_json(&layer.name, display_name, Some(layer))
         })
         .collect();
+    layer_list_body(
+        layers,
+        konnect_sexp::layers::copper(&stack).len(),
+        json!({
+            "enabled_layers": board_source::FROM_SAVED_BOARD,
+            "layer_ids": board_source::FROM_SAVED_BOARD,
+            "layer_names": board_source::FROM_SAVED_BOARD,
+            "layer_types": board_source::FROM_SAVED_BOARD,
+            "copper_layer_count": board_source::FROM_DERIVED,
+        }),
+        why.evidence(),
+        None,
+    )
+}
 
-    Ok(CallToolResult::json(
-        &json!({ "count": layers.len(), "layers": layers }),
+async fn handle_get_layer_list(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let source = match BoardSource::from_args(args) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
+    };
+
+    let observation = board_source::read_board(
+        ctx,
+        &board_path,
+        source,
+        "layer list",
+        |client, document| client.get_enabled_layers_with_names_in(document),
+    )
+    .await?;
+
+    // Read the file only once an answer is going to be built from it. A
+    // refusal never touches it, and parsing a board to reach the `(layers …)`
+    // block near its top means reading every footprint, track and zone below.
+    let enabled = match observation {
+        board_source::BoardRead::Refused(refusal) => return Ok(refusal),
+        board_source::BoardRead::Saved(why) => return Ok(saved_layer_list(&board_path, &why)),
+        board_source::BoardRead::Live(enabled) => enabled,
+    };
+
+    // KiCad names the enabled set by its own layer enum, which is not the
+    // ordinal the file writes, so the file's entry is joined by canonical name
+    // rather than by id.
+    let saved = saved_stackup(&board_path);
+    let stack = saved.as_deref().unwrap_or(&[]);
+    let layers: Vec<serde_json::Value> = enabled
+        .layers
+        .iter()
+        .map(|layer| {
+            layer_json(
+                &layer.name,
+                layer.display_name.as_deref().unwrap_or(&layer.name),
+                stack.iter().find(|saved| saved.name == layer.name),
+            )
+        })
+        .collect();
+    let file_backed = if saved.is_ok() {
+        board_source::FROM_SAVED_BOARD
+    } else {
+        board_source::FROM_UNAVAILABLE
+    };
+    Ok(layer_list_body(
+        layers,
+        enabled.copper_layer_count as usize,
+        json!({
+            "enabled_layers": board_source::FROM_IPC,
+            "layer_ids": file_backed,
+            "layer_names": board_source::FROM_IPC,
+            "layer_types": file_backed,
+            "copper_layer_count": board_source::FROM_IPC,
+        }),
+        board_source::live_evidence(),
+        saved.err().map(|reason| {
+            format!(
+                "A layer's id and type have no KiCad IPC equivalent and the saved board file \
+                 could not be read ({reason}), so both are null."
+            )
+        }),
     ))
 }
 
@@ -3193,13 +3326,14 @@ mod board_session_safety_tests {
         let dir = tempfile::tempdir().unwrap();
         let board = super::mounting_hole_tests::blank_board(dir.path());
         let before = std::fs::read(&board).unwrap();
-        let result = board_lock_refusal_with(&board, |_| {
+        let observed = live_board::editor_lock_with(&board, |_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "mock access denied",
             ))
-        })
-        .expect("inspection failure must refuse");
+        });
+        let result =
+            board_lock_refusal_from(&board, observed).expect("inspection failure must refuse");
 
         assert_eq!(
             crate::mcp::error::extract_error_kind(&result).as_deref(),
@@ -3207,6 +3341,57 @@ mod board_session_safety_tests {
         );
         assert_eq!(error_reason(&result), "kicad_lock_unreadable");
         assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    /// Both refusals are correct, but `reason` is machine-readable and the
+    /// lock is the more specific evidence, so folding the observed-live and
+    /// transport-loss arms together must not change which one a client sees.
+    #[tokio::test]
+    async fn an_exact_board_lock_still_outranks_the_previously_live_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).expect("a lock path");
+        std::fs::write(&lock, "someone@somewhere").unwrap();
+        let ctx = ctx_talking_to(String::new());
+        ctx.board_session.observe_live(&board);
+
+        let write = attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+            .await
+            .unwrap();
+        let BoardWrite::Refused(refusal) = write else {
+            panic!("a locked, previously live board must refuse the file")
+        };
+        assert_eq!(error_reason(&refusal), "kicad_lock_present");
+
+        let guard = refuse_if_board_open_in_kicad(&ctx, &board, "test edit")
+            .await
+            .unwrap()
+            .expect("the file-only guard refuses too");
+        assert_eq!(error_reason(&guard), "kicad_lock_present");
+    }
+
+    /// KiCad answering that it no longer holds the board is not a transport
+    /// loss, so a stale lock beside it is not the evidence — the observation
+    /// is.
+    #[tokio::test]
+    async fn a_board_kicad_reports_closed_names_the_observation_not_a_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+        std::fs::write(&elsewhere, "").unwrap();
+        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).expect("a lock path");
+        std::fs::write(&lock, "someone@somewhere").unwrap();
+        let server = spawn_kicad_holding_board(&elsewhere, |_| None);
+        let ctx = ctx_talking_to(server.address().to_string());
+        ctx.board_session.observe_live(&board);
+
+        let write = attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+            .await
+            .unwrap();
+        let BoardWrite::Refused(refusal) = write else {
+            panic!("a previously live board KiCad no longer holds must refuse")
+        };
+        assert_eq!(error_reason(&refusal), "board_previously_observed_live");
     }
 
     #[tokio::test]
