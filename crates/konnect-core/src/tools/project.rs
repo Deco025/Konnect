@@ -11,7 +11,7 @@
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
-use crate::tools::{get_path, opt_str, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, invalid_arg, opt_str, require_str, ToolContext, ToolDef};
 use konnect_sexp::{commit_file_transaction, FileTransition, SexpError};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -210,6 +210,16 @@ async fn handle_create_project(
         Ok(n) => n.to_string(),
         Err(e) => return Ok(e),
     };
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".kicad_pro"))
+    {
+        return Ok(invalid_arg(
+            "path",
+            "pass the containing directory as 'path' and the project filename stem as 'name'",
+        ));
+    }
 
     let pro_path = path.join(format!("{}.kicad_pro", name));
     let sch_path = path.join(format!("{}.kicad_sch", name));
@@ -792,6 +802,41 @@ mod tests {
             .unwrap();
         let pro: serde_json::Value = serde_json::from_str(&pro_content).unwrap();
         assert_eq!(pro["meta"]["filename"], "widget.kicad_pro");
+    }
+
+    #[tokio::test]
+    async fn create_project_rejects_kicad_pro_path_without_writing() {
+        let ctx = test_ctx();
+        for extension in ["kicad_pro", "KICAD_PRO"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let project_dir = dir.path().join("newproj");
+            let project_file = project_dir.join(format!("newproj.{extension}"));
+            let args = json!({
+                "path": project_file.to_str().unwrap(),
+                "name": "newproj"
+            });
+
+            let result = handle_create_project(&args, &ctx)
+                .await
+                .expect("handler should return a structured invalid argument");
+
+            assert!(result.is_error);
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("invalid_argument")
+            );
+            let body = response_json(&result);
+            assert_eq!(body["error"]["field"], "path");
+            assert!(
+                body["error"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("containing directory")
+                        && reason.contains("'name'")),
+                "{body}"
+            );
+            assert!(!project_dir.exists());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
     }
 
     #[tokio::test]
