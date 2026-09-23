@@ -373,6 +373,60 @@ pub struct ServerConfig {
 #[cfg(test)]
 pub(crate) static KICAD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// A project directory whose `sym-lib-table` resolves `Device:R` and
+/// `power:PWR_FLAG` to their stock KiCad 10 definitions. Put the test's
+/// schematic in the returned directory.
+#[cfg(test)]
+pub(crate) fn stock_reference_prefix_libraries(
+) -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+    let guard = KICAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/reference_prefix_kicad10");
+    let dir = tempfile::tempdir().unwrap();
+    // Escaped, as KiCad writes it: raw, the Windows `…\tests\…` reads `\t` as a TAB.
+    let lib = |name: &str| {
+        let uri = fixtures.join(format!("{name}.kicad_sym"));
+        format!(
+            "  (lib (name \"{name}\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\"))\n",
+            library::quote_lib_table_string(&uri.display().to_string())
+        )
+    };
+    std::fs::write(
+        dir.path().join("sym-lib-table"),
+        format!(
+            "(sym_lib_table\n  (version 7)\n{}{})\n",
+            lib("Device"),
+            lib("power")
+        ),
+    )
+    .unwrap();
+    std::env::set_var("KICAD10_SYMBOL_DIR", dir.path());
+    (dir, guard)
+}
+
+/// `(lib_id, reference, instance references)` of every symbol, sorted.
+#[cfg(test)]
+pub(crate) fn placed_references(path: &std::path::Path) -> Vec<(String, String, Vec<String>)> {
+    let sch = konnect_schematic_editor::Schematic::load(path).unwrap();
+    let mut refs: Vec<_> = sch
+        .symbols
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.lib_id.clone(),
+                symbol.reference().unwrap_or_default().to_string(),
+                symbol
+                    .instances()
+                    .into_iter()
+                    .filter_map(|instance| instance.reference)
+                    .collect(),
+            )
+        })
+        .collect();
+    refs.sort();
+    refs
+}
+
 #[cfg(test)]
 mod query_cache_tests {
     use super::*;

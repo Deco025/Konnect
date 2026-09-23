@@ -107,7 +107,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Y position in mm" },
                     "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
                     "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
-                    "reference": { "type": "string", "description": "Optional override for reference designator" },
+                    "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
                     "footprint": { "type": "string", "description": "Optional override for the library symbol's Footprint" },
                     "unit": { "type": "integer", "minimum": 1, "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 }
@@ -626,8 +626,6 @@ async fn handle_add_schematic_component(
         Ok(unit) => unit.unwrap_or(1),
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
-    let ref_str = reference.unwrap_or("?");
-
     // Load via konnect-schematic-editor
     let mut sch = cse::Schematic::load(&sch_path)?;
 
@@ -670,7 +668,7 @@ async fn handle_add_schematic_component(
         y,
         rotation,
         mirror,
-        ref_str,
+        reference,
         value,
         footprint,
         unit,
@@ -689,7 +687,7 @@ async fn handle_add_schematic_component(
         expected_y,
         rotation,
         mirror,
-        ref_str,
+        &placed.reference,
         &placed.fields,
         unit,
     );
@@ -717,7 +715,7 @@ async fn handle_add_schematic_component(
     // KiCad's netlister treats it as unconnected. Runs after the write because
     // it re-reads the saved file; `place_one_component` stays pure so the batch
     // path can do one junction pass for the whole batch instead of one per part.
-    let junctions = match crate::tools::add_pin_midwire_junctions(&sch_path, ref_str) {
+    let junctions = match crate::tools::add_pin_midwire_junctions(&sch_path, &placed.reference) {
         Ok(junctions) => junctions,
         Err(error) => {
             let uncertain = crate::tools::mutation_outcome_uncertain(
@@ -869,7 +867,7 @@ pub(crate) fn place_one_component(
     y: f64,
     rotation: f64,
     mirror: Option<&str>,
-    reference: &str,
+    reference: Option<&str>,
     value: Option<&str>,
     footprint: Option<&str>,
     unit: u32,
@@ -884,6 +882,13 @@ pub(crate) fn place_one_component(
     }
     let metadata = cse::library::symbol_metadata(sch, lib_id);
     let fields = PlacementFields::resolve(lib_id, &metadata, value, footprint);
+    // Unannotated, but keeping the library prefix: annotation numbers `R?`
+    // as `R1`, while a bare `?` becomes `1` and a `#FLG` loses the `#` that
+    // keeps it off the board (#669).
+    let reference = match reference {
+        Some(reference) => reference.to_owned(),
+        None => format!("{}?", metadata.reference),
+    };
 
     // Validate the unit against the resolved symbol BEFORE writing anything:
     // eeschema silently renders an out-of-range unit as unit 1 and the
@@ -931,7 +936,7 @@ pub(crate) fn place_one_component(
     let centred = cse::library::FieldJustify::default();
     sym.properties.push(positioned(
         "Reference",
-        reference,
+        &reference,
         ref_x,
         ref_y,
         ref_rot,
@@ -978,13 +983,17 @@ pub(crate) fn place_one_component(
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
     for instance_path in instance_paths {
-        sym.set_instance_path(project_name, instance_path, reference, unit);
+        sym.set_instance_path(project_name, instance_path, &reference, unit);
     }
 
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
 
-    Ok(PlacedComponent { uuid, fields })
+    Ok(PlacedComponent {
+        uuid,
+        reference,
+        fields,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1019,6 +1028,7 @@ impl PlacementFields {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlacedComponent {
     pub(crate) uuid: String,
+    pub(crate) reference: String,
     pub(crate) fields: PlacementFields,
 }
 
@@ -4856,6 +4866,59 @@ mod tests {
         );
         assert_eq!(fields.value, "10k");
         assert_eq!(fields.footprint, "Resistor_THT:R_Axial");
+    }
+
+    /// A placement without `reference` keeps the stock library prefix, so
+    /// annotation yields `R1` and `#FLG01`, not `1` and `2` (#669).
+    #[tokio::test]
+    async fn add_component_without_reference_keeps_library_prefix() {
+        let (dir, _env) = crate::tools::stock_reference_prefix_libraries();
+        let path = dir.path().join("prefix.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        for (lib_id, x) in [("Device:R", 101.6), ("power:PWR_FLAG", 127.0)] {
+            let result = handle_add_schematic_component(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": lib_id,
+                    "x": x, "y": 101.6,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{lib_id}: {result:?}");
+        }
+        assert_eq!(
+            crate::tools::placed_references(&path),
+            vec![
+                ("Device:R".into(), "R?".into(), vec!["R?".into()]),
+                (
+                    "power:PWR_FLAG".into(),
+                    "#FLG?".into(),
+                    vec!["#FLG?".into()]
+                ),
+            ]
+        );
+
+        let result =
+            handle_annotate_schematic(&json!({ "schematic": path.display().to_string() }), &ctx)
+                .await
+                .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            crate::tools::placed_references(&path),
+            vec![
+                ("Device:R".into(), "R1".into(), vec!["R1".into()]),
+                (
+                    "power:PWR_FLAG".into(),
+                    "#FLG01".into(),
+                    vec!["#FLG01".into()]
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
