@@ -198,6 +198,18 @@ state, so the saved `.kicad_pcb` is not known to be authoritative. The error
 confirms that Konnect left it unchanged
 ([#240](https://github.com/mixelpixx/Konnect/issues/240)).
 
+KiCad running with no PCB editor open is *not* this state: nothing was ever
+identified, so a `board_source` read answers from the saved file and says
+`no_pcb_editor_at_endpoint`. The refusal below is only for a board this server
+did observe live.
+
+Read-only tools that take a `board_source` selector report the same kind for the
+same reason, and nothing was going to be written: under the default
+`board_source: "auto"` they refuse rather than present a possibly stale file as
+the board's current state. The recovery below applies, and inspecting the
+snapshot deliberately — `board_source: "saved"`, which answers and states its
+freshness limitation — is also available there.
+
 Recover deliberately:
 
 1. Reopen or recover the board in KiCad.

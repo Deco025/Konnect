@@ -98,6 +98,79 @@ Callers do not change their requests. A caller that matched
 supported; the fix is that the refusal now says which footprint to substitute
 and for which parts.
 
+## Unreleased: `get_layer_list` and `get_netclasses` answer about the live board (minor release)
+
+Both tools previously parsed the saved `.kicad_pcb` unconditionally. A board
+open in KiCad with unsaved changes was therefore answered from the file on
+disk, and nothing in `get_layer_list`'s response said so.
+
+Both now take an optional `board_source` selector:
+
+- `auto` (the default, and what an existing caller gets) uses the exact board
+  KiCad holds open, and reads the saved file only when the response can state
+  why no live observation was used;
+- `live` returns a structured error unless the exact board is open in a
+  reachable KiCad;
+- `saved` inspects the last saved file and reports that unsaved editor changes
+  are excluded.
+
+Under `auto` and `live`, a query that fails after KiCad has positively
+identified the board — a rejection, or an editor this session had reached that
+is no longer reachable — is returned as an error rather than answered from the
+saved file.
+
+Under `live`, a reachable KiCad that holds some other board returns the
+established `wrong_document` error naming the boards it does hold, rather than
+a generic unavailability.
+
+A KiCad running with no PCB editor open — the project manager alone, which
+refuses `GetOpenDocuments` itself — is not a live board and never identified
+one, so `auto` answers from the saved file and reports
+`no_pcb_editor_at_endpoint` (or its `…_with_editor_lock` /
+`…_with_uninspectable_lock` forms). `live` refuses. A board this server
+observed live before that editor closed is the exception and still refuses, as
+`unsafe_file_fallback`. Mutating tools treat this state exactly as they did
+before it had a name.
+
+An endpoint whose build does not implement `GetOpenDocuments` at all falls back
+the same way, under its own reason `open_documents_unimplemented_at_endpoint`
+(with the same two lock forms). It is reported separately because it is not
+evidence about KiCad's editors: nothing was identified, and a board may still
+be open with unsaved changes behind a command that was never answered.
+
+Both responses gain a `sources` object naming the origin of each domain
+(`ipc`, `saved_board`, `project_file`, `derived`, `unavailable`) and a
+`source_evidence` object carrying `board_state`,
+`excludes_unsaved_editor_state`, a machine-readable `reason` and its prose
+`detail`. `get_layer_list` additionally reports `copper_layer_count` and a
+per-layer `display_name`; its `id`, `type` and `user_name` remain file-backed
+and are `null` for a layer the live editor has enabled that the saved file does
+not carry. `get_netclasses` keeps its existing `nets_source` string, whose
+wording now also covers the live case.
+
+`get_layer_list` also refuses, rather than answering, when KiCad returns an
+`AS_OK` with no enabled-layer set: no board has zero enabled layers, and
+reporting that non-answer as a live stackup of nothing would be a confident
+lie about a board whose real stackup is in the file. A layer whose *name*
+KiCad declines is different — the enabled set it did give still stands, and
+that layer reports its canonical name.
+
+The `display_name` lookups are one IPC round trip per layer, and together they
+get ten seconds of KiCad's time. That is a bound on the waiting, not only on
+when the last lookup may start: the lookups stop once it is spent, and each one
+that starts waits at most what is left of it rather than the client's usual
+30-second reply timeout. A live read of a KiCad that slows to a crawl therefore
+returns inside the bound, with `display_name: null` on the layers it did not
+get to and the canonical `name` on every layer as always.
+
+`error.kind: "unsafe_file_fallback"` can now be returned by a read. It carries
+the same `reason` as the write path — the fact is the same one — but nothing
+was going to be written: reporting the saved file as current is the unsafe act
+it refuses. `board_source: "saved"` inspects that snapshot deliberately.
+
+Callers that want the previous behaviour exactly should pass
+`board_source: "saved"`.
+
 ## Unreleased: force-directed refinement refuses unsafe plans
 
 `refine_placement_force_directed` is deprecated as a recommended bulk-cleanup

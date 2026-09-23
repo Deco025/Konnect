@@ -1,6 +1,9 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
 mod board_session;
+mod board_source;
+#[cfg(test)]
+mod board_source_contract_tests;
 pub mod cli;
 pub mod config;
 pub(crate) mod cross_probe;
@@ -12,6 +15,7 @@ mod footprint_metadata;
 mod footprint_models;
 pub mod integration;
 pub mod library;
+pub(crate) mod live_board;
 pub mod manufacturing;
 pub(crate) mod navigation_target;
 pub mod pcb_board;
@@ -487,13 +491,136 @@ where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
+    Ok(
+        match with_bound_board_ipc_classified(ctx, board_path, move |client, _| f(client)).await? {
+            Ok(BoardBinding::Bound(value)) => Ok(value),
+            // Preserved, not decided. Every caller of this helper saw an
+            // endpoint that served no board as a plain rejection before those
+            // cases were given names, and this does not change what any of
+            // them do with it.
+            Ok(BoardBinding::Unserved { message, .. }) => {
+                Err(konnect_ipc::IpcFailure::Rejected(message))
+            }
+            Err(failure) => Err(failure),
+        },
+    )
+}
+
+/// Whether a board-targeted call reached the board at all.
+pub(crate) enum BoardBinding<T> {
+    /// KiCad named one document for the requested board, and `f` ran.
+    Bound(T),
+    /// KiCad answered without ever naming a board document, so nothing was
+    /// identified and `f` never ran. `absence` says which of the two answers
+    /// that was, because they support different statements about KiCad.
+    Unserved {
+        absence: BoardEditorAbsence,
+        message: String,
+    },
+}
+
+/// Why KiCad answered a board-targeted call without naming a board.
+///
+/// Both leave Konnect with no live board, and both are answers rather than
+/// transport failures — but only one of them says anything about KiCad's
+/// editors, and the disclosure a caller reads must not claim more than the
+/// status code carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoardEditorAbsence {
+    /// `AS_UNHANDLED`: no handler for board documents is registered at this
+    /// endpoint. This is what the project manager looks like with no PCB
+    /// editor open — a state with no editor whose unsaved work could be at
+    /// stake.
+    NoPcbEditor,
+    /// `AS_UNIMPLEMENTED`: this build does not implement the command that
+    /// names open documents. Whether a PCB editor is behind the endpoint was
+    /// never established, so nothing may be claimed about one.
+    OpenDocumentsUnimplemented,
+}
+
+impl BoardEditorAbsence {
+    /// The machine-readable reason code a saved-file answer discloses. Part of
+    /// the closed `source_evidence.reason` vocabulary a client matches on.
+    pub(crate) fn reason_code(self) -> &'static str {
+        match self {
+            Self::NoPcbEditor => "no_pcb_editor_at_endpoint",
+            Self::OpenDocumentsUnimplemented => "open_documents_unimplemented_at_endpoint",
+        }
+    }
+
+    /// What KiCad actually said, in prose, as the clause following "KiCad is
+    /// running but …". It states only what the status code carries: an
+    /// unimplemented command is not evidence that no editor is open.
+    pub(crate) fn observed(self) -> &'static str {
+        match self {
+            Self::NoPcbEditor => "reports no PCB editor at this endpoint",
+            Self::OpenDocumentsUnimplemented => {
+                "does not implement the command that names its open documents, so whether a PCB \
+                 editor holds this board was never established"
+            }
+        }
+    }
+
+    /// Classify the status KiCad answered with, or `None` when the refusal
+    /// says nothing about whether documents can be named here.
+    fn from_error(error: &anyhow::Error) -> Option<Self> {
+        let status = konnect_ipc::ApiStatusError::from_error(error)?;
+        let code =
+            |code: konnect_ipc::gen::kiapi::common::ApiStatusCode| status.code == code as i32;
+        if code(konnect_ipc::gen::kiapi::common::ApiStatusCode::AsUnhandled) {
+            Some(Self::NoPcbEditor)
+        } else if code(konnect_ipc::gen::kiapi::common::ApiStatusCode::AsUnimplemented) {
+            Some(Self::OpenDocumentsUnimplemented)
+        } else {
+            None
+        }
+    }
+}
+
+/// As [`with_board_ipc_classified`], handing `f` the document KiCad resolved
+/// rather than leaving it to ask again.
+///
+/// Targeting is the whole point of this helper, and a closure that re-derives
+/// its own document pays a second `GetOpenDocuments` for the privilege — or,
+/// worse, reaches for a `KiCadIpcClient` method with no document argument,
+/// which addresses whichever board KiCad opened first.
+pub(crate) async fn with_bound_board_ipc_classified<T, F>(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+    f: F,
+) -> anyhow::Result<Result<BoardBinding<T>, konnect_ipc::IpcFailure>>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &konnect_ipc::client::KiCadIpcClient,
+            konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+        ) -> anyhow::Result<T>
+        + Send
+        + 'static,
+{
     let requested = board_path.to_path_buf();
     let observation = requested.clone();
     let memory = ctx.board_session.clone();
     with_ipc_classified(ctx.config.ipc_address.clone(), move |client| {
-        client.ensure_board_is_active(&requested)?;
+        let document = match client.find_open_board(&requested) {
+            Ok(document) => document,
+            // Classified by the typed status in the chain, never by message
+            // text. It has to happen here: `IpcFailure` keeps only the
+            // rendered message, so by the time the caller sees one the status
+            // is gone — and the two unsupported statuses part company here,
+            // because only one of them is evidence about KiCad's editors.
+            Err(error) => match BoardEditorAbsence::from_error(&error) {
+                Some(absence) => {
+                    return Ok(BoardBinding::Unserved {
+                        absence,
+                        message: format!("{error:#}"),
+                    })
+                }
+                None => return Err(error),
+            },
+        };
         memory.observe_live(&observation);
-        f(client)
+        f(client, document).map(BoardBinding::Bound)
     })
     .await
 }
