@@ -4921,6 +4921,82 @@ mod tests {
         );
     }
 
+    /// The mid-wire junction pass must look the part up by its resolved `R?`:
+    /// keyed on the omitted reference it finds nothing, adds no dot, and still
+    /// succeeds, leaving both pins unconnected.
+    #[tokio::test]
+    async fn served_add_component_without_reference_joins_pins_landing_mid_wire() {
+        let (dir, _env) = crate::tools::stock_reference_prefix_libraries();
+        let path = dir.path().join("prefix.kicad_sch");
+        let schematic = path.display().to_string();
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let call = |name: &str, arguments: serde_json::Value| {
+            let message = json!({"jsonrpc": "2.0", "id": 669, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}});
+            let handler = &handler;
+            async move {
+                let result = handler
+                    .handle_message(message)
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                assert_ne!(result["isError"], true, "{result}");
+                serde_json::from_str::<serde_json::Value>(
+                    result["content"][0]["text"].as_str().unwrap(),
+                )
+                .unwrap()
+            }
+        };
+
+        call("create_schematic", json!({ "path": schematic })).await;
+        // Device:R at (101.6, 101.6) puts its pins at y 97.79 and 105.41.
+        for y in [97.79, 105.41] {
+            call(
+                "add_wire",
+                json!({ "schematic": schematic, "x1": 96.52, "y1": y, "x2": 106.68, "y2": y }),
+            )
+            .await;
+        }
+        let placed = call(
+            "add_schematic_component",
+            json!({ "schematic": schematic, "lib_id": "Device:R", "x": 101.6, "y": 101.6 }),
+        )
+        .await;
+
+        let pins = [(101.6, 97.79), (101.6, 105.41)];
+        let matches = |points: Vec<(f64, f64)>| {
+            points.len() == pins.len()
+                && pins.iter().all(|&(px, py)| {
+                    points.iter().any(|&(x, y)| {
+                        konnect_sexp::geometry::points_coincident(px, py, x, y, 0.01)
+                    })
+                })
+        };
+        let reported = placed["junctions_added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| (point["x"].as_f64().unwrap(), point["y"].as_f64().unwrap()))
+            .collect();
+        assert!(matches(reported), "{placed}");
+        let saved = cse::Schematic::load(&path).unwrap();
+        assert!(
+            matches(saved.junctions.iter().map(|j| (j.x, j.y)).collect()),
+            "without these dots KiCad leaves both pins of R? unconnected"
+        );
+    }
+
     #[tokio::test]
     async fn add_component_writes_requested_unit() {
         let (dir, _env) = stub_symbol_dir();
