@@ -2338,7 +2338,7 @@ fn prepare_lib_table_registration(
     })
 }
 
-fn quote_lib_table_string(value: &str) -> String {
+pub(crate) fn quote_lib_table_string(value: &str) -> String {
     format!("\"{}\"", escape_library_string(value))
 }
 

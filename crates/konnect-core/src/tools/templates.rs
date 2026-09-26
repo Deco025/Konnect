@@ -473,7 +473,7 @@ async fn handle_apply_template(
                 y,
                 0.0,
                 None,
-                &reference,
+                Some(&reference),
                 Some(value),
                 None,
                 1,

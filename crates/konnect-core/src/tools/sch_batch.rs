@@ -74,8 +74,9 @@ pub fn tools() -> Vec<ToolDef> {
              explicitly overrides it. Pins that land mid-segment on an existing wire gain the \
              required junction in the same atomic write; the response reports \
              junctions_added_count and junctions_pruned_count. \
-             Pass explicit references -- there is no auto-numbering; an omitted reference \
-             becomes '?' like an eeschema-unannotated symbol, same as add_schematic_component.",
+             There is no auto-numbering: an omitted reference becomes the library prefix \
+             plus '?' (e.g. 'R?', '#FLG?'), like an eeschema-unannotated symbol, same as \
+             add_schematic_component; annotate_schematic numbers it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -544,7 +545,7 @@ async fn handle_batch_place_components(
                 continue;
             }
         };
-        let reference = comp["reference"].as_str().unwrap_or("?");
+        let reference = comp["reference"].as_str();
         let value = comp["value"].as_str();
         let footprint = comp["footprint"].as_str();
         let unit = match opt_u32(comp, "unit") {
@@ -582,7 +583,7 @@ async fn handle_batch_place_components(
                     expected_y,
                     rotation,
                     mirror,
-                    reference,
+                    &placed.reference,
                     &placed.fields,
                     unit,
                 ));
@@ -595,7 +596,7 @@ async fn handle_batch_place_components(
                 failures.push(json!({
                     "index": index,
                     "lib_id": lib_id,
-                    "reference": reference,
+                    "reference": reference.unwrap_or("?"),
                     "kind": kind,
                     "message": message
                 }));
@@ -2105,6 +2106,42 @@ mod batch_place_and_connect_tests {
                 .lines()
                 .any(|line| line.ends_with(' ') || line.ends_with('\t')),
             "batch placement must not leave trailing whitespace: {after:?}"
+        );
+    }
+
+    /// An entry without `reference` keeps the stock library prefix (#669).
+    // Holds the env guard across awaits on purpose; see the note on
+    // `sch_components::tests`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn batch_place_without_reference_keeps_library_prefix() {
+        let (dir, _env) = crate::tools::stock_reference_prefix_libraries();
+        let path = dir.path().join("prefix.kicad_sch");
+        std::fs::write(&path, crate::tools::blank_schematic_template()).unwrap();
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": path.display().to_string(),
+                "components": [
+                    { "lib_id": "Device:R", "x": 101.6, "y": 101.6 },
+                    { "lib_id": "power:PWR_FLAG", "x": 127.0, "y": 101.6 }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        assert_eq!(
+            crate::tools::placed_references(&path),
+            vec![
+                ("Device:R".into(), "R?".into(), vec!["R?".into()]),
+                (
+                    "power:PWR_FLAG".into(),
+                    "#FLG?".into(),
+                    vec!["#FLG?".into()]
+                ),
+            ]
         );
     }
 

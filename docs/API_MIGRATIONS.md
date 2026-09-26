@@ -3,6 +3,21 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: an omitted reference keeps the library prefix (patch release)
+
+`add_schematic_component` and `batch_place_components` wrote a bare `?` when
+the caller passed no `reference`, dropping the library symbol's prefix.
+`annotate_schematic` then numbered the symbol `1`, and a `#`-prefixed symbol
+such as `power:PWR_FLAG` lost the `#` that keeps it off the board (#669).
+
+The default is now the library `Reference` property plus `?` (`R?`, `#FLG?`),
+as eeschema places a symbol, so annotation yields `R1` and `#FLG01`. It
+appears in the written symbol, its `(instances …)` records and the response's
+`fields.Reference`. A library symbol with no `Reference` property still gets
+`?`. An explicit `reference` is unchanged, and so is `batch_place_components`'
+failure entry, which still reports `"reference": "?"` for an entry that named
+none.
+
 ## Unreleased: configuration tools refuse a file they cannot use (minor release)
 
 `load_user_config`, `save_user_config`, `load_project_config`,
